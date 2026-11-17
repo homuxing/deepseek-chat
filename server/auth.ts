@@ -10,8 +10,8 @@ import {
 } from './security.js'
 import type { AppEnv, UserRow } from './types.js'
 
-const SESSION_COOKIE = 'private_chat_session'
-const HANDOFF_COOKIE = 'private_chat_admin_handoff'
+const SESSION_COOKIE = 'deepseek_chat_session'
+const HANDOFF_COOKIE = 'deepseek_chat_admin_handoff'
 const SESSION_DURATION = 7 * 24 * 60 * 60 * 1000
 
 export const publicUser = (user: UserRow) => ({

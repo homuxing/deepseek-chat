@@ -1,7 +1,7 @@
 {
-  "name": "chat-demo",
+  "name": "deepseek-chat",
   "version": "0.1.1",
-  "description": "基于 Cloudflare Workers、Hono、D1 与 R2 的私有 DeepSeek 聊天服务。",
+  "description": "Deepseek Chat",
   "license": "MIT",
   "private": true,
   "type": "module",
@@ -13,8 +13,9 @@
     "lint": "oxlint src server rspack.config.ts",
     "test": "node --test --test-concurrency=1 tests/*.test.mjs",
     "deploy": "pnpm build && wrangler deploy",
-    "db:migrate:local": "wrangler d1 migrations apply private-chat --local",
-    "db:migrate:remote": "wrangler d1 migrations apply private-chat --remote",
+    "secret:put": "wrangler secret put",
+    "db:migrate:local": "wrangler d1 migrations apply DB --local",
+    "db:migrate:remote": "wrangler d1 migrations apply DB --remote",
     "format": "oxfmt --write ."
   },
   "dependencies": {

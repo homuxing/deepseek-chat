@@ -105,7 +105,7 @@ const env = {
   FILES: new LocalR2(),
   ASSETS: {
     fetch: async () =>
-      new Response('<html>private chat</html>', { headers: { 'Content-Type': 'text/html' } }),
+      new Response('<html>Deepseek Chat</html>', { headers: { 'Content-Type': 'text/html' } }),
   },
   DEEPSEEK_API_KEY: 'sk-deployment-secret',
   API_KEY_ENCRYPTION_KEY: 'test-encryption-secret-with-more-than-32-characters',
@@ -177,7 +177,7 @@ const call = (path, { method = 'GET', body, cookie, headers = {}, csrf = true, o
     env
   )
 
-const cookieFrom = (res, name = 'private_chat_session') => {
+const cookieFrom = (res, name = 'deepseek_chat_session') => {
   const match = res.headers.get('set-cookie')?.match(new RegExp(`${name}=([^; ,]+)`))
   assert.ok(match, `missing ${name} cookie`)
   return `${name}=${match[1]}`
@@ -227,7 +227,7 @@ test('auth fails closed; CSRF and administrator Access signatures are enforced',
   })
   assert.equal(entry.status, 303)
   assert.equal(entry.headers.get('Location'), '/api/admin/access/callback')
-  const handoff = cookieFrom(entry, 'private_chat_admin_handoff')
+  const handoff = cookieFrom(entry, 'deepseek_chat_admin_handoff')
   assert.equal((await call('/api/admin/access/callback')).status, 200)
   const login = await call('/api/admin/login', { method: 'POST', cookie: handoff })
   assert.equal(login.status, 200)
@@ -273,7 +273,7 @@ test('invite consumption is bounded and failed registration rolls back usage', a
   assert.equal((await call('/api/admin/users', { cookie: alice.cookie })).status, 403)
 })
 
-const session = (title = 'Alice private chat') => ({
+const session = (title = 'Alice chat') => ({
   id: 'shared-id',
   title,
   createdAt: 1,
@@ -305,7 +305,7 @@ test('D1 chats and R2 originals remain isolated even with identical identifiers'
       await call('/api/chats/shared-id', {
         method: 'PUT',
         cookie: bob.cookie,
-        body: { session: session('Bob private chat') },
+        body: { session: session('Bob chat') },
       })
     ).status,
     204
@@ -317,7 +317,7 @@ test('D1 chats and R2 originals remain isolated even with identical identifiers'
   })
   assert.equal(
     (await (await call('/api/chats/shared-id', { cookie: alice.cookie })).json()).session.title,
-    'Alice private chat'
+    'Alice chat'
   )
   await call('/api/chats/shared-id', { method: 'DELETE', cookie: bob.cookie })
   assert.equal((await call('/api/chats/shared-id', { cookie: alice.cookie })).status, 200)

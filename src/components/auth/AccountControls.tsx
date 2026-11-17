@@ -4,7 +4,6 @@ import { AdminPanel } from '../admin/AdminPanel.js'
 import { Modal } from '../base/Modal.js'
 import styles from './AccountControls.module.css'
 
-/** 私人实例的账户入口，可放在设置、侧边栏或移动端抽屉中。 */
 export const AccountControls = () => {
   const { user } = useAuth()
   const [loggingOut, setLoggingOut] = useState(false)

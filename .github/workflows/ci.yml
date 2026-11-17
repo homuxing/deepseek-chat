@@ -1,4 +1,4 @@
-name: Validate private chat
+name: Deepseek Chat CI
 
 on:
   push:

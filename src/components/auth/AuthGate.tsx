@@ -27,7 +27,6 @@ const usernamePattern = /^[a-zA-Z0-9_-]{3,32}$/
 const hasValidUsername = (value: string) => usernamePattern.test(value)
 const hasValidPassword = (value: string) => value.length >= 10 && value.length <= 128
 
-/** 私人部署入口：先验证现有会话，再决定显示登录、注册或聊天正文。 */
 export const AuthGate = ({ children }: { children: ReactNode }) => {
   const { user, loading, error } = useAuth()
   const [mode, setMode] = useState<AuthMode>('login')
@@ -137,20 +136,13 @@ export const AuthGate = ({ children }: { children: ReactNode }) => {
           <span className={styles.mark} aria-hidden="true">
             D
           </span>
-          <span>私人部署</span>
+          <span>Deepseek Chat</span>
         </header>
 
         <div className={styles.intro}>
           <h1 id="auth-heading" className={styles.title}>
-            {adminEntry ? '管理员入口' : mode === 'login' ? '登录私人实例' : '创建账户'}
+            {adminEntry ? '管理员登录' : mode === 'login' ? '登录' : '注册'}
           </h1>
-          <p className={styles.subtitle}>
-            {adminEntry
-              ? '通过 Cloudflare Access 验证管理员身份后即可继续。'
-              : mode === 'login'
-                ? '使用账户密码继续访问你的对话与设置。'
-                : '输入邀请码创建账户，数据只保存在此私有部署中。'}
-          </p>
         </div>
 
         {!adminEntry ? (

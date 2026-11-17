@@ -62,7 +62,6 @@ const toLocalInputValue = (timestamp: number) => {
   return new Date(timestamp - offset).toISOString().slice(0, 16)
 }
 
-/** 私人部署管理台：邀请码与用户生命周期管理。 */
 export const AdminPanel = ({
   variant = 'page',
 }: {
@@ -305,7 +304,7 @@ export const AdminPanel = ({
         <header className={styles.topbar}>
           <div className={styles.topbarInner}>
             <div>
-              <div className={styles.eyebrow}>私人部署</div>
+              <div className={styles.eyebrow}>Deepseek Chat</div>
               <h1 className={styles.heading}>管理控制台</h1>
             </div>
             <a className={styles.backLink} href="/">

@@ -1,8 +1,9 @@
 {
   "$schema": "node_modules/wrangler/config-schema.json",
-  "name": "private-deepseek-chat",
+  "name": "deepseek-chat",
   "main": "server/index.ts",
   "compatibility_date": "2026-11-17",
+  "keep_vars": true,
   "triggers": { "crons": ["17 3 * * *"] },
   "assets": {
     "directory": "./dist",
@@ -13,15 +14,10 @@
   "d1_databases": [
     {
       "binding": "DB",
-      "database_name": "private-chat",
-      "database_id": "REPLACE_WITH_YOUR_D1_DATABASE_ID",
+      "database_name": "chat",
+      "database_id": "c29f816d-5fe1-493d-a56a-65743dec41fb",
       "migrations_dir": "migrations",
     },
   ],
-  "r2_buckets": [{ "binding": "FILES", "bucket_name": "private-chat-files" }],
-  "vars": {
-    "CF_ACCESS_TEAM_DOMAIN": "your-team.cloudflareaccess.com",
-    "CF_ACCESS_AUD": "REPLACE_WITH_ACCESS_APPLICATION_AUD",
-    "ADMIN_EMAILS": "admin@example.com",
-  },
+  "r2_buckets": [{ "binding": "FILES", "bucket_name": "chat" }],
 }
