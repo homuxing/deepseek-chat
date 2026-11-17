@@ -17,25 +17,36 @@ export const useApiKeyEditor = () => {
 
 type ApiKeyEditor = ReturnType<typeof useApiKeyEditor>
 
-/** API Key：保存后只显示掩码，点编辑按钮才能重新输入 */
+/** Custom API Key：只显示固定掩码；可编辑替换，也可明确清除后回退到部署 Key。 */
 export const ApiKeyField = ({ editor }: { editor: ApiKeyEditor }) => {
   const t = useTranslate()
   const isMobile = useIsMobile()
-  const { apiKey, editing, setEditing, form, showInput } = editor
+  const { apiKey, editing, setEditing, form } = editor
 
   return (
     <div className={styles.cell}>
       <div className={styles.apiKey}>
-        <div className={styles.label}>{t('apiKeyStart')}</div>
+        <div className={styles.label}>{t('apiKeyCustomLabel')}</div>
+        <div className={styles.description}>{t('apiKeyFallbackDescription')}</div>
         {apiKey && !editing ? (
           <div className={styles.apiKeySaved}>
-            <span className={styles.apiKeyMask}>{'*'.repeat(apiKey.length)}</span>
-            <IconButton
-              tone="primary"
-              icon={<IconEditOutline16 />}
-              tooltip={t('apiKeyEdit')}
-              onClick={() => setEditing(true)}
-            />
+            <span className={styles.apiKeyMask}>{'*'.repeat(12)}</span>
+            <div className={styles.apiKeyActions}>
+              <button
+                type="button"
+                className={styles.confirm}
+                disabled={form.verifying}
+                onClick={() => void form.clear()}
+              >
+                {form.verifying ? t('apiKeyClearing') : t('apiKeyClear')}
+              </button>
+              <IconButton
+                tone="primary"
+                icon={<IconEditOutline16 />}
+                tooltip={t('apiKeyEdit')}
+                onClick={() => setEditing(true)}
+              />
+            </div>
           </div>
         ) : (
           <div className={styles.apiKeyInput}>
@@ -77,7 +88,7 @@ export const ApiKeyField = ({ editor }: { editor: ApiKeyEditor }) => {
             ) : null}
           </div>
         )}
-        {showInput && form.error ? <div className={styles.error}>{form.error}</div> : null}
+        {form.error ? <div className={styles.error}>{form.error}</div> : null}
       </div>
     </div>
   )

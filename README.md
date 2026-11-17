@@ -1,75 +1,60 @@
-# chat-demo
+# Private DeepSeek Chat
 
-English | [简体中文](README.zh-CN.md)
+English | [简体中文 / detailed deployment guide](README.zh-CN.md)
 
-A static chat demo powered by the DeepSeek API. No application backend is required: the browser connects directly to the configured API service.
+A private deployment of DeepSeek's official chat demo. React and Hono run on one Cloudflare Worker. D1 stores users, invitations, login sessions and chat history; a private R2 bucket stores original attachments.
 
-You can [try the app online](https://deepseek-ai.github.io/chat-demo/) or download the archive from [Releases](https://github.com/deepseek-ai/deepseek-chat-demo/releases), extract it, and double-click `index.html` to use it locally without installation or a build. Enter your API key in Settings before your first chat.
+Users register with a username, password and invitation. Administrators sign in through Cloudflare Access with JWT signature, issuer, audience, expiry and email allowlist checks. The admin console creates/deletes invitations, manages users and clears selected users' history. Password changes and account disabling revoke sessions.
 
-## Getting started
-
-Install Node.js 22.12+ and pnpm, then run:
-
-```sh
-git clone https://github.com/deepseek-ai/chat-demo.git
-cd chat-demo
-pnpm install
-pnpm dev
-```
-
-Open http://localhost:8090.
-
-To build the static site:
-
-```sh
-pnpm build
-```
-
-The output is written to `dist/`. Deploy it to a static web server or open `dist/index.html` directly. Opening the file directly requires browser support for storage on `file://` pages and an API service that permits their cross-origin requests.
-
-## Features
-
-- Multiple conversations with automatic titles, renaming, and deletion; edit prompts, regenerate replies, and switch between message branches.
-- Streaming replies, deep thinking, smart search, link reading, and source citations; stop generation or continue eligible replies.
-- Upload, paste, or drag and drop attachments; use voice input and read replies aloud. A live audio spectrum appears in the first row of the input area while recording on mobile.
-- Markdown, syntax highlighting, KaTeX math, and Mermaid diagrams.
-- Simplified Chinese and English, light and dark themes, mobile layouts, location settings, and chat history import and export.
-
-## Data and storage
-
-Your API key and settings are stored in the browser's localStorage. Conversations and original attachments are stored in IndexedDB. Local data is isolated by browser profile and site origin. Sending messages, uploading attachments, and using speech features sends the relevant content to the configured API service.
-
-History import and export in Settings use ZIP archives. After confirmation and successful validation, importing replaces all local conversations and attachments. Exports include conversations and locally available original images, but exclude API keys, settings, and original non-image attachments. See the [history import/export documentation (Chinese)](src/services/chat/history/README.md) for the archive format and preservation details.
-
-Settings → Data → Delete all chats clears all local conversations, original attachments, and unsent drafts after confirmation. It stops ongoing replies and returns to a new chat. Your API key and settings are preserved; files already uploaded to the API service are not deleted.
+All DeepSeek requests use the authenticated Worker proxy, including streaming chat, attachments and speech. A user's custom API key takes precedence over DEEPSEEK_API_KEY. Custom keys are AES-GCM encrypted in D1 and never returned to the browser or stored in localStorage.
 
 ## Development
 
-| Command       | Description                  |
-| ------------- | ---------------------------- |
-| `pnpm dev`    | Start the development server |
-| `pnpm build`  | Build into `dist/`           |
-| `pnpm type`   | Run TypeScript type checks   |
-| `pnpm lint`   | Lint with oxlint             |
-| `pnpm format` | Format with oxfmt            |
+Use Node.js 24 and pnpm:
 
-[rspack.config.ts](rspack.config.ts) uses `https://api.deepseek.com` by default. Use `createConfig({ apiOrigin, devServer })` to customize the API origin and development server proxy.
-
-Chat uses `deepseek-flash` by default through Anthropic-compatible Messages / Files APIs. Speech features use ASR / TTS endpoints. Requests include extensions for search, link reading, titles, and `latest_reminder`, so the configured service must support the corresponding capabilities. Supported attachment formats are determined by server-side validation.
-
-```text
-src/
-  app/                 Application layout, themes, and global styles
-  components/          Chat, settings, Markdown, and other UI components
-  i18n/                English and Chinese translations
-  services/
-    api/               API requests, SSE, and protocol types
-    chat/              Conversations, message branches, storage, and history import/export
-    markdown/          Markdown parsing, syntax highlighting, and diagrams
-    speech/            Audio recording and read-aloud playback
-  utils/               Shared utilities
+```sh
+pnpm install
+cp .dev.vars.example .dev.vars
+pnpm build
+pnpm db:migrate:local
+pnpm dev:worker
 ```
 
-## License
+Set secrets in `.dev.vars` and visit `http://localhost:8787`. For frontend hot reload, also run `pnpm dev` and visit `http://localhost:8090`; `/api` is proxied to the Worker. Local administrators need a real Access-protected test hostname via Cloudflare Tunnel. There is no production authentication bypass.
 
-[MIT](LICENSE). The build copies the license to `dist/LICENSE`; include it when distributing the app. Third-party dependencies are subject to their own licenses.
+## Deployment
+
+```sh
+pnpm exec wrangler login
+pnpm exec wrangler d1 create private-chat
+pnpm exec wrangler r2 bucket create private-chat-files
+```
+
+Update the D1 database_id in `wrangler.jsonc` and bind a custom domain to the Worker. Create a Cloudflare Access self-hosted application protecting only `chat.example.com/api/admin/access*`. Allow admin emails and configure CF_ACCESS_TEAM_DOMAIN, CF_ACCESS_AUD, and comma-separated ADMIN_EMAILS. Set APP_ORIGIN to the public HTTPS origin.
+
+```sh
+pnpm exec wrangler secret put DEEPSEEK_API_KEY
+pnpm exec wrangler secret put API_KEY_ENCRYPTION_KEY
+pnpm db:migrate:remote
+pnpm deploy
+```
+
+Use a random encryption secret of at least 32 characters and keep a backup. Replacing it without migrating ciphertext makes existing saved custom keys unreadable. Keep R2 private. Click administrator sign-in, then open Settings → General → Manage to create invitations.
+
+## Storage and validation
+
+History is scoped to the authenticated user and available across devices. ZIP imports replace chats atomically with new IDs for imported originals, so failed imports cannot overwrite old originals. Imports accept at most 200 conversations and 1 MiB of JSON; each conversation is limited to 900 KiB. Browser IndexedDB data is not automatically migrated; export from the original demo and import here.
+
+Deleting chats cleans up unreferenced R2 originals. DeepSeek's uploaded files are not automatically deleted. Messages, attachments and speech are still sent to DeepSeek. Original chat model and protocol extensions remain unchanged.
+
+```sh
+pnpm type
+pnpm lint
+pnpm test
+pnpm build
+pnpm exec wrangler deploy --dry-run
+```
+
+CI runs validation only. No GitHub Pages publication or automatic cloud deployment is configured.
+
+[MIT](LICENSE). Keep dist/LICENSE when distributing the app.

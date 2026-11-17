@@ -11,7 +11,7 @@ export const en = {
   sessionListLoadFailed: 'Unable to load the chat list. Please try again.',
   sessionLoadFailed: 'Unable to load this chat. Please try again.',
   sessionSaveFailed:
-    'Chats or attachments have not been saved locally. Retry before closing this page.',
+    'Chats or attachments have not been saved to your account. Please retry.',
   sessionDeleteFailed: 'Unable to delete this chat. Please try again.',
   settings: 'Settings',
   appName: 'API usage demo',
@@ -104,19 +104,26 @@ export const en = {
   avatarMenuSettingsDialogThemeSelectDarkOption: 'Dark',
   avatarMenuSettingsDialogThemeSelectSystemOption: 'System',
   apiKeyStart: 'Enter an API Key to get started',
+  apiKeyCustomLabel: 'Custom API Key (optional)',
+  apiKeyFallbackDescription:
+    'Leave this empty to use the API Key configured for this deployment.',
   apiKeyEdit: 'Edit API Key',
   apiKeyPlaceholder: 'Enter API Key',
   apiKeyVerifying: 'Verifying...',
+  apiKeyClear: 'Clear',
+  apiKeyClearing: 'Clearing...',
   confirm: 'Confirm',
   apiKeyInvalid: 'Invalid API Key. Please check it and try again.',
   apiKeyVerificationFailed: 'Verification failed: {message}',
+  apiKeySaveFailed: 'Unable to save the custom API Key: {message}',
+  apiKeyClearFailed: 'Unable to clear the custom API Key: {message}',
   historyImport: 'Import chat history',
   historyImportConfirm: 'Import',
   historyImportConfirmTitle: 'Import chat history?',
   historyImportConfirmDescription:
-    'The uploaded chat history will replace all your current chats. Import anyway?',
+    'The uploaded chat history will replace all chats in your account. Import anyway?',
   historyImportDescription:
-    'Importing chat history replaces all local chats and attachments. Supports ZIP files exported from DeepSeek.',
+    'Importing chat history replaces all chats and attachments saved in your account. Supports ZIP files exported from DeepSeek.',
   historyImportedOne: 'Imported 1 chat',
   historyImported: 'Imported {count} chats',
   historyImportFailed:
@@ -124,12 +131,12 @@ export const en = {
   historyExportFailed: 'Export failed: {message}',
   exportAllLabel: 'Export all chats',
   historyExportDescription:
-    'Includes all chat history and locally stored images. Other attachments retain file details only. Your API Key is not included.',
+    'Includes all chat history and stored images. Other attachments retain file details only. Your API Key is not included.',
   exportAllDownload: 'Download',
   deleteAllSessions: 'Delete all chats',
   deleteAllSessionsModalTitle: 'Once deleted, all chats will be cleared and cannot be recovered.',
   deleteAllSessionsModalDescription:
-    'Locally saved attachments and unsent drafts will also be deleted.',
+    'Stored attachments and unsent drafts will also be deleted.',
   historyDeleting: 'Deleting...',
   historyDeleted: 'Successfully deleted.',
   historyDeleteFailed: 'Failed to delete chats. Please try again.',

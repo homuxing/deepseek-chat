@@ -1,250 +1,266 @@
-import { openDB, type DBSchema, type IDBPDatabase } from 'idb'
+import { apiJson, backendFetch, backendResponseError, getBackendUserId } from '../backend.js'
 import { toSessionSummary, type Session, type SessionSummary } from './types.js'
 
-/** IndexedDB 存储结构版本；新增或调整存储、索引时递增。 */
-const DB_VERSION = 11
-
-/** 文件原件按附件的本地 id 存储，所有引用同一 id 的消息共用一份；用于缩略图、打开查看，以及没有 serverId 时补传。 */
+/** Original attachment bytes are stored server-side and are scoped to the current user. */
 export type StoredFile = {
   id: string
   blob: Blob
 }
 
-/** 文件引用留在摘要中，删除会话时通过索引判断原件是否仍被引用。 */
-type StoredSessionSummary = SessionSummary & { fileIds: string[] }
-
-interface ChatDB extends DBSchema {
-  /** 当前使用的会话，界面读写都在这里 */
-  sessions: { key: string; value: Session }
-  sessionSummaries: {
-    key: string
-    value: StoredSessionSummary
-    indexes: { fileIds: string }
-  }
-  /** 当前使用的文件原件 */
-  files: { key: string; value: StoredFile }
-  /**
-   * 历史导入的暂存：导入过程中会话与原件只写入这两个存储，`sessions` / `files` 保持不变；
-   * 全部校验通过后在一个事务中替换正式数据并清空暂存，失败时只清空暂存。
-   */
-  sessionsStaging: { key: string; value: Session }
-  filesStaging: { key: string; value: StoredFile }
+type SessionResponse = {
+  session: Session
 }
 
-let dbPromise: Promise<IDBPDatabase<ChatDB>> | null = null
+type SessionListResponse = {
+  sessions: SessionSummary[]
+}
 
-const storedSummary = (session: Session): StoredSessionSummary => ({
-  ...toSessionSummary(session),
-  fileIds: [
-    ...new Set(
-      session.messages.flatMap((message) =>
-        message.role === 'user' ? message.files.map((file) => file.id) : []
-      )
-    ),
-  ],
-})
+const stagingSessions = new Map<string, Session>()
+const stagingFiles = new Map<string, StoredFile>()
+const MAX_IMPORT_BYTES = 1024 * 1024
 
-const abortTransaction = (tx: { abort(): void }) => {
-  try {
-    tx.abort()
-  } catch {
-    // 事务已因请求失败中止。
+/**
+ * Serialize writes for each conversation. A save may wait for original uploads before
+ * updating D1, so later state from a previous save must not overwrite newer state.
+ */
+const sessionMutations = new Map<string, Promise<void>>()
+
+const assertBackendUser = (expectedUserId: string | null) => {
+  if (getBackendUserId() !== expectedUserId) {
+    throw new Error('Backend user changed before storage mutation completed')
   }
 }
 
-// 每个操作拿到连接后立即创建事务；IndexedDB 按创建顺序执行范围重叠的事务，读取总能看到之前发起的写入。
-const getDB = () =>
-  (dbPromise ??= openDB<ChatDB>('chat-demo', DB_VERSION, {
-    upgrade(db, _oldVersion, _newVersion, tx) {
-      // 初始化当前格式需要的存储与索引，不迁移旧消息。
-      for (const name of ['sessions', 'files', 'sessionsStaging', 'filesStaging'] as const) {
-        if (!db.objectStoreNames.contains(name)) {
-          db.createObjectStore(name, { keyPath: 'id' })
-        }
-      }
-      const summaries = db.objectStoreNames.contains('sessionSummaries')
-        ? tx.objectStore('sessionSummaries')
-        : db.createObjectStore('sessionSummaries', { keyPath: 'id' })
-      if (!summaries.indexNames.contains('fileIds')) {
-        summaries.createIndex('fileIds', 'fileIds', { multiEntry: true })
-      }
-    },
-  }).catch((error: unknown) => {
-    // 打开失败后允许界面重试，避免一直复用已拒绝的 Promise。
-    dbPromise = null
-    throw error
-  }))
-
-export const loadSessionSummaries = async (): Promise<SessionSummary[]> =>
-  (await (await getDB()).getAll('sessionSummaries')).map(toSessionSummary)
-
-export const loadSession = async (id: string): Promise<Session | undefined> =>
-  (await getDB()).get('sessions', id)
-
-export const saveSession = async (session: Session, files: StoredFile[] = []): Promise<void> => {
-  const summary = storedSummary(session)
-  const tx = (await getDB()).transaction(['sessions', 'sessionSummaries', 'files'], 'readwrite')
-  await Promise.all([
-    (async () => {
-      try {
-        for (const file of files) {
-          await tx.objectStore('files').put(file)
-        }
-        await tx.objectStore('sessions').put(session)
-        await tx.objectStore('sessionSummaries').put(summary)
-      } catch (error) {
-        abortTransaction(tx)
-        throw error
-      }
-    })(),
-    tx.done,
-  ])
+const enqueueSessionMutation = (
+  id: string,
+  run: (expectedUserId: string | null) => Promise<void>
+): Promise<void> => {
+  // Capture before yielding to the queue; the closure must not bind to a newer tab's user.
+  const expectedUserId = getBackendUserId()
+  const previous = sessionMutations.get(id) ?? Promise.resolve()
+  const current = previous
+    .catch(() => {})
+    .then(async () => {
+      assertBackendUser(expectedUserId)
+      await run(expectedUserId)
+    })
+  sessionMutations.set(id, current)
+  const remove = () => {
+    if (sessionMutations.get(id) === current) {
+      sessionMutations.delete(id)
+    }
+  }
+  current.then(remove, remove)
+  return current
 }
 
-/** 未打开的会话也可重命名，只读取该会话，原子更新详情和列表。 */
-export const renameSession = async (id: string, title: string): Promise<void> => {
-  const tx = (await getDB()).transaction(['sessions', 'sessionSummaries'], 'readwrite')
-  await Promise.all([
-    (async () => {
-      try {
-        const sessions = tx.objectStore('sessions')
-        const session = await sessions.get(id)
-        if (session) {
-          session.title = title
-          await sessions.put(session)
-          await tx.objectStore('sessionSummaries').put(storedSummary(session))
-        }
-      } catch (error) {
-        abortTransaction(tx)
-        throw error
-      }
-    })(),
-    tx.done,
-  ])
+const waitForSessionMutations = async () => {
+  await Promise.allSettled(sessionMutations.values())
 }
 
-/** 删除会话，仅清理已无会话引用的本地原件；远端文件不删。 */
-export const deleteSession = async (sessionId: string): Promise<void> => {
-  const tx = (await getDB()).transaction(['sessions', 'sessionSummaries', 'files'], 'readwrite')
-  await Promise.all([
-    (async () => {
-      try {
-        const summaries = tx.objectStore('sessionSummaries')
-        const summary = await summaries.get(sessionId)
-        await tx.objectStore('sessions').delete(sessionId)
-        await summaries.delete(sessionId)
-        for (const id of summary?.fileIds ?? []) {
-          if ((await summaries.index('fileIds').count(id)) === 0) {
-            await tx.objectStore('files').delete(id)
-          }
-        }
-      } catch (error) {
-        abortTransaction(tx)
-        throw error
-      }
-    })(),
-    tx.done,
-  ])
+const chatPath = (id: string) => `/api/chats/${encodeURIComponent(id)}`
+const filePath = (id: string) => `/api/files/${encodeURIComponent(id)}`
+const jsonHeaders = { 'Content-Type': 'application/json' }
+
+const uploadOriginal = async (file: StoredFile): Promise<void> => {
+  const response = await backendFetch(filePath(file.id), {
+    method: 'POST',
+    headers: file.blob.type ? { 'Content-Type': file.blob.type } : undefined,
+    body: file.blob,
+  })
+  if (!response.ok) {
+    throw await backendResponseError(response)
+  }
 }
 
-const putFiles = async (store: 'files' | 'filesStaging', files: StoredFile[]) => {
-  const tx = (await getDB()).transaction(store, 'readwrite')
-  await Promise.all([...files.map((file) => tx.store.put(file)), tx.done])
-}
-
-export const saveFiles = (files: StoredFile[]): Promise<void> => putFiles('files', files)
-
-export const loadFile = async (id: string): Promise<Blob | undefined> =>
-  (await (await getDB()).get('files', id))?.blob
-
-/** 清空导入暂存：开始导入前清除上次中断（如关闭页面）遗留的数据，导入失败后清除本次写入。 */
-export const clearStaging = async (): Promise<void> => {
-  const tx = (await getDB()).transaction(['sessionsStaging', 'filesStaging'], 'readwrite')
-  await Promise.all([
-    tx.objectStore('sessionsStaging').clear(),
-    tx.objectStore('filesStaging').clear(),
-    tx.done,
-  ])
-}
-
-export const addStagingSession = async (session: Session): Promise<void> => {
-  await (await getDB()).add('sessionsStaging', session)
-}
-
-export const saveStagingFiles = (files: StoredFile[]): Promise<void> =>
-  putFiles('filesStaging', files)
-
-/** 图片位于会话 JSON 之后；全部读完后回填具体 MIME，保留归档给出的 isImage 标识。 */
-export const updateStagingFileTypes = async (types: ReadonlyMap<string, string>): Promise<void> => {
-  const tx = (await getDB()).transaction('sessionsStaging', 'readwrite')
-  await Promise.all([
-    (async () => {
-      for (let cursor = await tx.store.openCursor(); cursor; cursor = await cursor.continue()) {
-        const session = cursor.value
-        let changed = false
-        for (const message of session.messages) {
-          if (message.role !== 'user') {
-            continue
-          }
-          for (const file of message.files) {
-            const type = types.get(file.id) ?? ''
-            if (file.mimeType !== type) {
-              file.mimeType = type
-              changed = true
-            }
-          }
-        }
-        if (changed) {
-          await cursor.update(session)
-        }
-      }
-    })(),
-    tx.done,
-  ])
+const uploadOriginals = async (files: StoredFile[]): Promise<void> => {
+  await Promise.all(files.map(uploadOriginal))
 }
 
 /**
- * 导入完成后用暂存替换正式数据：同一事务中替换会话、摘要和原件，并清空暂存。
- * 逐条游标复制，同一时间只读取一条记录；事务失败时整体回滚，正式数据不变。
+ * Give staged originals fresh IDs for one import attempt. Sessions are cloned so the
+ * remapped references cannot alter the staging snapshot needed for a later retry.
  */
-export const commitStaging = async (): Promise<SessionSummary[]> => {
-  const summaries: SessionSummary[] = []
-  const tx = (await getDB()).transaction(
-    ['sessions', 'sessionSummaries', 'files', 'sessionsStaging', 'filesStaging'],
-    'readwrite'
-  )
-  const move = async (from: 'sessionsStaging' | 'filesStaging', to: 'sessions' | 'files') => {
-    try {
-      const target = tx.objectStore(to)
-      await target.clear()
-      if (to === 'sessions') {
-        await tx.objectStore('sessionSummaries').clear()
+const remapStagingForCommit = () => {
+  const files: StoredFile[] = []
+  const remappedIds = new Map<string, string>()
+  for (const file of stagingFiles.values()) {
+    const id = crypto.randomUUID()
+    remappedIds.set(file.id, id)
+    files.push({ id, blob: file.blob })
+  }
+
+  const sessions = structuredClone([...stagingSessions.values()])
+  for (const session of sessions) {
+    for (const message of session.messages) {
+      if (message.role !== 'user') {
+        continue
       }
-      for (
-        let cursor = await tx.objectStore(from).openCursor();
-        cursor;
-        cursor = await cursor.continue()
-      ) {
-        await target.put(cursor.value)
-        if (to === 'sessions') {
-          const summary = storedSummary(cursor.value as Session)
-          await tx.objectStore('sessionSummaries').put(summary)
-          summaries.push(toSessionSummary(summary))
+      for (const file of message.files) {
+        const id = remappedIds.get(file.id)
+        if (id) {
+          file.id = id
+          file.serverId = null
         }
       }
-      await tx.objectStore(from).clear()
-    } catch (error) {
-      // 同步抛出的错误不会让事务自动回滚，需显式中止，避免只提交清空和部分移入。
-      abortTransaction(tx)
-      throw error
     }
   }
-  await Promise.all([move('sessionsStaging', 'sessions'), move('filesStaging', 'files'), tx.done])
-  // 直接返回本次提交的列表，调用方无需在替换成功后再发起可能失败的读取。
-  return summaries
+  return { files, sessions }
 }
 
-/** 本地存储失败不打断对话，只在控制台留痕 */
+export const loadSessionSummaries = async (): Promise<SessionSummary[]> => {
+  const body = await apiJson<SessionListResponse>('/api/chats')
+  return body.sessions.map(toSessionSummary)
+}
+
+export const loadSession = async (id: string): Promise<Session | undefined> => {
+  const response = await backendFetch(chatPath(id))
+  if (response.status === 404) {
+    return undefined
+  }
+  if (!response.ok) {
+    throw await backendResponseError(response)
+  }
+  const body = (await response.json()) as SessionResponse
+  return body.session
+}
+
+/**
+ * Save an immutable snapshot. Serialization happens before awaiting file uploads so
+ * store state can continue changing while the request is in flight.
+ */
+export const saveSession = (session: Session, files: StoredFile[] = []): Promise<void> => {
+  const id = session.id
+  const body = JSON.stringify({ session })
+  const originals = files.map((file) => ({ id: file.id, blob: file.blob }))
+  return enqueueSessionMutation(id, async (expectedUserId) => {
+    await uploadOriginals(originals)
+    assertBackendUser(expectedUserId)
+    await apiJson<unknown>(chatPath(id), {
+      method: 'PUT',
+      headers: jsonHeaders,
+      body,
+    })
+  })
+}
+
+/** Rename without loading the conversation; the server updates its summary atomically. */
+export const renameSession = (id: string, title: string): Promise<void> => {
+  const body = JSON.stringify({ title })
+  return enqueueSessionMutation(id, async () => {
+    await apiJson<unknown>(chatPath(id), {
+      method: 'PATCH',
+      headers: jsonHeaders,
+      body,
+    })
+  })
+}
+
+/** Delete a conversation. The server removes any originals no longer referenced by it. */
+export const deleteSession = (sessionId: string): Promise<void> =>
+  enqueueSessionMutation(sessionId, async () => {
+    await apiJson<unknown>(chatPath(sessionId), { method: 'DELETE' })
+  })
+
+export const saveFiles = async (files: StoredFile[]): Promise<void> => {
+  const expectedUserId = getBackendUserId()
+  assertBackendUser(expectedUserId)
+  await uploadOriginals(files)
+}
+
+export const loadFile = async (id: string): Promise<Blob | undefined> => {
+  const response = await backendFetch(filePath(id))
+  if (response.status === 404) {
+    return undefined
+  }
+  if (!response.ok) {
+    throw await backendResponseError(response)
+  }
+  return response.blob()
+}
+
+export const deleteFile = async (id: string): Promise<void> => {
+  const expectedUserId = getBackendUserId()
+  assertBackendUser(expectedUserId)
+  await apiJson<unknown>(filePath(id), { method: 'DELETE' })
+}
+
+export const deleteStoredFile = deleteFile
+
+/** Clear only the in-memory import staging; no remote data is touched. */
+export const clearStaging = async (): Promise<void> => {
+  stagingSessions.clear()
+  stagingFiles.clear()
+}
+
+export const addStagingSession = async (session: Session): Promise<void> => {
+  if (stagingSessions.has(session.id)) {
+    throw new Error(`Duplicate staged session: ${session.id}`)
+  }
+  stagingSessions.set(session.id, session)
+}
+
+export const saveStagingFiles = async (files: StoredFile[]): Promise<void> => {
+  for (const file of files) {
+    stagingFiles.set(file.id, file)
+  }
+}
+
+/** Image bytes arrive after session JSON, so fill their MIME types before upload. */
+export const updateStagingFileTypes = async (types: ReadonlyMap<string, string>): Promise<void> => {
+  for (const session of stagingSessions.values()) {
+    for (const message of session.messages) {
+      if (message.role !== 'user') {
+        continue
+      }
+      for (const file of message.files) {
+        file.mimeType = types.get(file.id) ?? ''
+      }
+    }
+  }
+}
+
+/**
+ * Each attempt uses fresh original IDs and checks the serialized request size before
+ * uploading. A failed import cannot overwrite existing originals or mutate staging.
+ */
+export const commitStaging = async (): Promise<SessionSummary[]> => {
+  const expectedUserId = getBackendUserId()
+  if (stagingSessions.size > 200) {
+    throw new Error('Chat history import supports at most 200 conversations')
+  }
+
+  if (stagingSessions.size === 0 && stagingFiles.size === 0) {
+    await waitForSessionMutations()
+    assertBackendUser(expectedUserId)
+    await apiJson<unknown>('/api/chats', { method: 'DELETE' })
+    await clearStaging()
+    return []
+  }
+
+  const remapped = remapStagingForCommit()
+  const body = JSON.stringify({ sessions: remapped.sessions })
+  if (new TextEncoder().encode(body).byteLength > MAX_IMPORT_BYTES) {
+    throw new Error('Chat history import exceeds the 1 MiB request limit')
+  }
+
+  await waitForSessionMutations()
+  assertBackendUser(expectedUserId)
+  await uploadOriginals(remapped.files)
+  assertBackendUser(expectedUserId)
+  const result = await apiJson<SessionListResponse>('/api/chats/import', {
+    method: 'POST',
+    headers: jsonHeaders,
+    body,
+  })
+  if (!Array.isArray(result.sessions)) {
+    throw new Error('The server returned an invalid imported chat list')
+  }
+  await clearStaging()
+  return result.sessions.map(toSessionSummary)
+}
+
+/** Server storage failures do not interrupt the conversation; keep the error in the console. */
 export const reportStorageError = (action: string) => (error: unknown) => {
   // eslint-disable-next-line no-console
   console.error(`[storage] ${action} failed`, error)

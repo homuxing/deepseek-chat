@@ -25,15 +25,15 @@ type ConfigOptions = {
 
 /** 创建构建配置，支持自定义 API 地址和开发服务器选项 */
 export const createConfig = ({
-  apiOrigin = 'https://api.deepseek.com',
+  apiOrigin = '/api',
   devServer,
 }: ConfigOptions = {}): Configuration => ({
   mode: dev ? 'development' : 'production',
   entry: './src/main.tsx',
   output: {
     path: path.resolve(root, 'dist'),
-    // 运行时按当前脚本地址推导资源路径，file:// 下异步 chunk、字体都按相对位置加载
-    publicPath: 'auto',
+    // Absolute asset URLs also work at the Access callback and other SPA paths.
+    publicPath: '/',
     filename: 'static/js/[name].[contenthash:8].js',
     chunkFilename: 'static/js/async/[name].[contenthash:8].js',
     cssFilename: 'static/css/[name].[contenthash:8].css',
@@ -86,7 +86,11 @@ export const createConfig = ({
     }),
   ],
   performance: { hints: false },
-  devServer: { port: 8090, ...devServer },
+  devServer: {
+    port: 8090,
+    proxy: [{ context: ['/api'], target: 'http://127.0.0.1:8787', changeOrigin: true }],
+    ...devServer,
+  },
 })
 
 // eslint-disable-next-line import/no-default-export

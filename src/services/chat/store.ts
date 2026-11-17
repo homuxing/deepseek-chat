@@ -117,6 +117,38 @@ let historyEpoch = 0
 let initTask: Promise<void> | undefined
 const sessionLoads = new Map<string, { promise: Promise<void> }>()
 
+/** Invalidate pending loads and saves before another identity can use this page. */
+export const resetChatState = () => {
+  historyEpoch++
+  for (const controller of Object.values(get().streaming)) {
+    controller.abort()
+  }
+  for (const controller of titleRequests) {
+    controller.abort()
+  }
+  titleRequests.clear()
+  clearAllDrafts()
+  sessionAccess.clear()
+  unsavedSessions.clear()
+  pendingFiles.clear()
+  deletingSessions.clear()
+  deletionTasks.clear()
+  streamFlushes.clear()
+  sessionLoads.clear()
+  initTask = undefined
+  set({
+    ready: false,
+    initError: false,
+    importingHistory: false,
+    sessions: [],
+    sessionCache: {},
+    sessionLoadErrors: {},
+    sessionSaveErrors: {},
+    activeId: null,
+    streaming: {},
+  })
+}
+
 const touchSession = (id: string) => sessionAccess.set(id, ++accessSequence)
 
 const trimSessionCache = () => {
@@ -967,6 +999,7 @@ const streamReply = async (sessionId: string, initial: AssistantMessage, request
   set((state) => ({ streaming: { ...state.streaming, [sessionId]: controller } }))
   let reply = initial
   let frame = 0
+  let lastCheckpoint = Date.now()
   const flush = () => {
     cancelAnimationFrame(frame)
     frame = 0
@@ -1029,6 +1062,12 @@ const streamReply = async (sessionId: string, initial: AssistantMessage, request
             flush()
           } else {
             frame ||= requestAnimationFrame(flush)
+          }
+          // Keep partial replies in D1 so abrupt tab closure does not lose the entire answer.
+          if (Date.now() - lastCheckpoint >= 5000) {
+            flush()
+            persist(sessionId)
+            lastCheckpoint = Date.now()
           }
         }
         reply = settleReply(reply, 'done', Date.now())

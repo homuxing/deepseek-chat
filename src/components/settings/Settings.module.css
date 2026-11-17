@@ -236,6 +236,13 @@
   user-select: none;
 }
 
+.apiKeyActions {
+  display: flex;
+  flex-shrink: 0;
+  align-items: center;
+  gap: 8px;
+}
+
 .apiKeyInput {
   gap: 12px;
   padding: 0 14px;

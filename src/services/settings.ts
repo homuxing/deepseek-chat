@@ -7,9 +7,10 @@ export type Locale = 'zh-CN' | 'en-US'
 /** 主题偏好；默认跟随系统 */
 export type ThemePreference = 'light' | 'dark' | 'system'
 
-/** 本机设置，存 localStorage：API Key、语言、主题、位置、朗读音色、深度思考与智能搜索开关、侧边栏收起状态 */
+/** 非秘密本机偏好存 localStorage；API Key 只以服务端“已配置”标记留在内存。 */
 type Settings = {
-  apiKey: string | null
+  /** 'configured' 表示当前用户已保存自定义 Key；真实 Key 永不进入前端持久化。 */
+  apiKey: 'configured' | null
   locale: Locale
   themePreference: ThemePreference
   location: UserLocation | null
@@ -20,7 +21,6 @@ type Settings = {
 }
 
 const KEYS = {
-  apiKey: 'chat-demo:api-key',
   locale: 'chat-demo:locale',
   location: 'chat-demo:location',
   themePreference: 'chat-demo:theme-preference',
@@ -30,9 +30,28 @@ const KEYS = {
   siderCollapsed: 'chat-demo:sider-collapsed',
 } as const
 
+const LEGACY_API_KEY = 'chat-demo:api-key'
+
+type LocalStorageLike = {
+  getItem(key: string): string | null
+  setItem(key: string, value: string): void
+  removeItem(key: string): void
+}
+
+const localSettingsStorage = (): LocalStorageLike | undefined => {
+  try {
+    return (globalThis as typeof globalThis & { localStorage?: LocalStorageLike }).localStorage
+  } catch {
+    return undefined
+  }
+}
+
+// Remove plaintext keys written by older builds.
+localSettingsStorage()?.removeItem(LEGACY_API_KEY)
+
 const read = (key: string) => {
   try {
-    return localStorage.getItem(key)
+    return localSettingsStorage()?.getItem(key) ?? null
   } catch {
     return null
   }
@@ -40,10 +59,14 @@ const read = (key: string) => {
 
 const write = (key: string, value: string | null) => {
   try {
+    const storage = localSettingsStorage()
+    if (!storage) {
+      return
+    }
     if (value === null) {
-      localStorage.removeItem(key)
+      storage.removeItem(key)
     } else {
-      localStorage.setItem(key, value)
+      storage.setItem(key, value)
     }
   } catch {
     // 存储不可用时只在内存中生效
@@ -88,7 +111,7 @@ const initialThemePreference = (): ThemePreference => {
 const initialTtsVoice = (): TtsVoice => (read(KEYS.ttsVoice) === 'tide' ? 'tide' : 'stella')
 
 export const useSettings = create<Settings>(() => ({
-  apiKey: read(KEYS.apiKey),
+  apiKey: null,
   locale: initialLocale(),
   location: initialLocation(),
   themePreference: initialThemePreference(),
@@ -120,8 +143,8 @@ export const setTtsVoice = (ttsVoice: TtsVoice) => {
 }
 
 export const setApiKey = (apiKey: string | null) => {
-  write(KEYS.apiKey, apiKey)
-  useSettings.setState({ apiKey })
+  // Keep the public signature for existing callers while accepting only the marker.
+  useSettings.setState({ apiKey: apiKey ? 'configured' : null })
 }
 
 export const setThinking = (thinking: boolean) => {
