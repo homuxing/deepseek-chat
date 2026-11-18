@@ -7,7 +7,7 @@ Based on DeepSeek's chat demo, with React, Hono, Cloudflare Workers, D1 and R2.
 ## Features
 
 - Invitation registration and password login.
-- Cloudflare Access administrator login, invitation and user management.
+- Administrator password login, invitation and user management.
 - Per-user chat history and attachments, with ZIP import and export.
 - Encrypted custom API keys, with `DEEPSEEK_API_KEY` as the fallback.
 - Streaming chat, reasoning, search and speech.
@@ -26,7 +26,7 @@ pnpm dev:worker
 
 Fill in `.dev.vars` and open `http://localhost:8787`. In PowerShell, use `Copy-Item .dev.vars.example .dev.vars`.
 
-For frontend hot reload, also run `pnpm dev` and open `http://localhost:8090`. Local administrator login requires an Access-protected hostname, for example through Cloudflare Tunnel.
+For frontend hot reload, also run `pnpm dev` and open `http://localhost:8090`. Administrator login is at `/admin`.
 
 ## Deployment
 
@@ -40,13 +40,15 @@ pnpm deploy
 
 In Workers & Pages → deepseek-chat → Settings → Variables and Secrets, configure:
 
-- **Text:** `CF_ACCESS_TEAM_DOMAIN` (e.g. `your-team.cloudflareaccess.com`), `CF_ACCESS_AUD` (admin application's AUD Tag), `ADMIN_EMAILS` (comma-separated emails).
+- **Text:** `ADMIN_USERNAME` (3–32 letters, digits, underscores or hyphens; case-insensitive).
 - **Optional Text:** `APP_ORIGIN` (site origin, e.g. `https://chat.example.com`), `DEEPSEEK_API_ORIGIN` (defaults to `https://api.deepseek.com`).
-- **Secret:** `DEEPSEEK_API_KEY`, `API_KEY_ENCRYPTION_KEY` (at least 32 random characters; keep a backup).
+- **Secret:** `ADMIN_PASSWORD` (10–128 characters), `DEEPSEEK_API_KEY`, `API_KEY_ENCRYPTION_KEY` (at least 32 random characters; keep a backup).
 
 `keep_vars: true` preserves dashboard text variables during deployment. Replacing the encryption secret makes existing saved API keys unreadable.
 
-Bind a domain to the Worker. In Cloudflare Zero Trust, create a Self-hosted Access application protecting `chat.example.com/api/admin/access*` and allow the administrator emails. Keep the remaining application paths outside this Access policy. Keep R2 public access disabled.
+Bind a domain to the Worker and keep R2 public access disabled. The administrator signs in with `ADMIN_USERNAME` and `ADMIN_PASSWORD`. Changing either setting invalidates existing administrator sessions; ordinary users cannot register the configured administrator username.
+
+Apply `pnpm db:migrate:remote` before deploying this update. The migration adds administrator session validation and revokes sessions from the previous login method, preserving users and chats. If you previously configured a Cloudflare Access application for this site, disable it to use password login.
 
 After administrator login, open Settings → General → Manage to create invitations and manage users.
 

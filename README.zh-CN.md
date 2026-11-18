@@ -7,7 +7,7 @@
 ## 功能
 
 - 邀请码注册、密码登录。
-- Cloudflare Access 管理员登录，邀请码和用户管理。
+- 管理员密码登录，邀请码和用户管理。
 - 按用户保存聊天记录和附件，支持 ZIP 导入导出。
 - 自定义 API Key 加密保存，未设置时使用 `DEEPSEEK_API_KEY`。
 - 流式聊天、深度思考、搜索和语音。
@@ -26,7 +26,7 @@ pnpm dev:worker
 
 填写 `.dev.vars`，访问 `http://localhost:8787`。PowerShell 使用 `Copy-Item .dev.vars.example .dev.vars`。
 
-前端热更新时另开终端运行 `pnpm dev`，访问 `http://localhost:8090`。本地管理员登录需要受 Access 保护的域名，可通过 Cloudflare Tunnel 配置。
+前端热更新时另开终端运行 `pnpm dev`，访问 `http://localhost:8090`。管理员登录入口为 `/admin`。
 
 ## 部署
 
@@ -40,13 +40,15 @@ pnpm deploy
 
 在 Workers & Pages → deepseek-chat → Settings → Variables and Secrets 配置：
 
-- **Text：** `CF_ACCESS_TEAM_DOMAIN`（如 `your-team.cloudflareaccess.com`）、`CF_ACCESS_AUD`（管理员应用的 AUD Tag）、`ADMIN_EMAILS`（多个邮箱用英文逗号分隔）。
+- **Text：** `ADMIN_USERNAME`（3–32 位字母、数字、下划线或短横线，不区分大小写）。
 - **可选 Text：** `APP_ORIGIN`（站点地址，如 `https://chat.example.com`）、`DEEPSEEK_API_ORIGIN`（默认 `https://api.deepseek.com`）。
-- **Secret：** `DEEPSEEK_API_KEY`、`API_KEY_ENCRYPTION_KEY`（至少 32 个随机字符，妥善备份）。
+- **Secret：** `ADMIN_PASSWORD`（10–128 个字符）、`DEEPSEEK_API_KEY`、`API_KEY_ENCRYPTION_KEY`（至少 32 个随机字符，妥善备份）。
 
 `keep_vars: true` 会在部署时保留后台文本变量。更换加密 Secret 后，已有自定义 API Key 无法解密。
 
-给 Worker 绑定域名，在 Cloudflare Zero Trust 创建 Self-hosted Access 应用，保护 `chat.example.com/api/admin/access*`，Allow 策略允许管理员邮箱；其余应用路径不纳入此策略。R2 不开启公共访问。
+给 Worker 绑定域名，R2 不开启公共访问。管理员使用 `ADMIN_USERNAME` 和 `ADMIN_PASSWORD` 登录，修改任意一项会使已有管理员会话失效。普通用户不能注册当前管理员用户名。
+
+更新部署前执行 `pnpm db:migrate:remote`。迁移会添加管理员会话校验字段并撤销旧登录方式的管理员会话，保留用户和聊天记录。如曾为站点配置 Cloudflare Access 应用，请将其停用后使用密码登录。
 
 管理员登录后，打开“设置 → 通用设置 → 管理”创建邀请码和管理用户。
 

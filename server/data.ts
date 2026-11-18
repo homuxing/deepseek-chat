@@ -68,7 +68,6 @@ type AdminUserRow = {
   role: 'admin' | 'user'
   status: 'active' | 'disabled'
   createdAt: number
-  access_sub: string | null
   api_key_ciphertext: string | null
   session_count: number
 }
@@ -211,7 +210,6 @@ const adminUserView = (row: AdminUserRow) => ({
   role: row.role,
   status: row.status,
   createdAt: row.createdAt,
-  accessSub: row.access_sub,
   sessionCount: Number(row.session_count),
   hasCustomApiKey: row.api_key_ciphertext !== null,
 })
@@ -333,10 +331,7 @@ const clearUserChats = async (
     env.DB.prepare('DELETE FROM chats WHERE user_id = ?').bind(userId),
   ]
   if (revokeSessions) {
-    statements.push(
-      env.DB.prepare('DELETE FROM auth_sessions WHERE user_id = ?').bind(userId),
-      env.DB.prepare('DELETE FROM login_handoffs WHERE user_id = ?').bind(userId)
-    )
+    statements.push(env.DB.prepare('DELETE FROM auth_sessions WHERE user_id = ?').bind(userId))
   }
   await env.DB.batch(statements)
 }
@@ -849,7 +844,6 @@ adminRoutes.get('/users', async (c) => {
        u.role,
        u.status,
        u.created_at AS createdAt,
-       u.access_sub,
        u.api_key_ciphertext,
        (SELECT COUNT(*) FROM chats chat WHERE chat.user_id = u.id) AS session_count
      FROM users u
@@ -902,7 +896,7 @@ adminRoutes.patch('/users/:id', async (c) => {
     return errorResponse('An administrator cannot disable their own account')
   }
   if (hasPassword && target.role === 'admin') {
-    return errorResponse('Administrator passwords are managed by Access')
+    return errorResponse('Administrator passwords are managed by ADMIN_PASSWORD')
   }
 
   const passwordHash =
@@ -941,7 +935,6 @@ adminRoutes.patch('/users/:id', async (c) => {
        u.role,
        u.status,
        u.created_at AS createdAt,
-       u.access_sub,
        u.api_key_ciphertext,
        (SELECT COUNT(*) FROM chats chat WHERE chat.user_id = u.id) AS session_count
      FROM users u

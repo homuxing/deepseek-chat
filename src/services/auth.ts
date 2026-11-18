@@ -68,9 +68,12 @@ export const register = async (
   acceptUser(user)
 }
 
-export const adminLogin = async (): Promise<void> => {
+export const adminLogin = async (username: string, password: string): Promise<void> => {
   try {
-    const { user } = await apiJson<{ user: AuthUser }>('/api/admin/login', { method: 'POST' })
+    const { user } = await apiJson<{ user: AuthUser }>('/api/admin/login', {
+      method: 'POST',
+      body: JSON.stringify({ username, password }),
+    })
     acceptUser(user)
   } finally {
     useAuth.setState({ loading: false })

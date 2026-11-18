@@ -37,7 +37,7 @@ export const AccountControls = () => {
                 管理
               </button>
             ) : (
-              <a className={styles.adminLink} href="/api/admin/access">
+              <a className={styles.adminLink} href="/admin">
                 管理员登录
               </a>
             )}

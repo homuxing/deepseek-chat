@@ -1,11 +1,32 @@
-import { createRemoteJWKSet, jwtVerify } from 'jose'
 import { HTTPException } from 'hono/http-exception'
-import type { Bindings } from './types.js'
 
 const encoder = new TextEncoder()
 const toBase64 = (bytes: Uint8Array): string => btoa(String.fromCharCode(...bytes))
 const fromBase64 = (value: string): Uint8Array =>
   Uint8Array.from(atob(value), (char) => char.charCodeAt(0))
+
+export const equalSecret = (actual: string, expected: string): boolean => {
+  const left = encoder.encode(actual)
+  const right = encoder.encode(expected)
+  if (left.length !== right.length) {
+    return false
+  }
+  let difference = 0
+  for (let i = 0; i < left.length; i++) {
+    difference |= left[i] ^ right[i]
+  }
+  return difference === 0
+}
+
+export const adminCredentialHash = async (username: string, password: string): Promise<string> => {
+  const salt = new Uint8Array(
+    await crypto.subtle.digest(
+      'SHA-256',
+      encoder.encode(JSON.stringify(['deepseek-chat-admin-session-v1', username]))
+    )
+  )
+  return toBase64(await derivePassword(password, salt))
+}
 
 export const randomToken = (): string =>
   toBase64(crypto.getRandomValues(new Uint8Array(32)))
@@ -103,47 +124,4 @@ export const decryptApiKey = async (ciphertext: string, secret: string): Promise
       fromBase64(data) as BufferSource
     )
   )
-}
-
-const keySets = new Map<string, ReturnType<typeof createRemoteJWKSet>>()
-
-export const verifyAccessIdentity = async (
-  token: string | undefined,
-  env: Bindings
-): Promise<{ sub: string; email: string }> => {
-  const team = env.CF_ACCESS_TEAM_DOMAIN?.replace(/^https:\/\//, '').replace(/\/$/, '')
-  if (
-    !team ||
-    !/^[a-z0-9-]+\.cloudflareaccess\.com$/i.test(team) ||
-    !env.CF_ACCESS_AUD ||
-    !env.ADMIN_EMAILS
-  ) {
-    throw new HTTPException(503, { message: '管理员 Cloudflare Access 配置不完整' })
-  }
-  if (!token) {
-    throw new HTTPException(401, { message: '请通过 Cloudflare Access 登录管理员入口' })
-  }
-  const issuer = `https://${team}`
-  let keys = keySets.get(issuer)
-  if (!keys) {
-    keys = createRemoteJWKSet(new URL(`${issuer}/cdn-cgi/access/certs`))
-    keySets.set(issuer, keys)
-  }
-  try {
-    const { payload } = await jwtVerify(token, keys, {
-      issuer,
-      audience: env.CF_ACCESS_AUD,
-      algorithms: ['RS256'],
-    })
-    const email = typeof payload.email === 'string' ? payload.email.toLowerCase() : ''
-    const allowed = env.ADMIN_EMAILS.split(',')
-      .map((value) => value.trim().toLowerCase())
-      .filter(Boolean)
-    if (!payload.sub || !email || !allowed.includes(email)) {
-      throw new Error('Identity is not an administrator')
-    }
-    return { sub: payload.sub, email }
-  } catch {
-    throw new HTTPException(403, { message: 'Cloudflare Access 身份无效或不在管理员白名单中' })
-  }
 }

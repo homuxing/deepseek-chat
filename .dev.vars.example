@@ -1,12 +1,11 @@
 # Local development only: copy to .dev.vars. Never commit real secrets.
 # Production values are set on the Worker in Cloudflare Settings > Variables and Secrets.
 # Secret variables:
+ADMIN_PASSWORD=replace-with-your-admin-password
 DEEPSEEK_API_KEY=sk-your-deepseek-key
 API_KEY_ENCRYPTION_KEY=replace-with-at-least-32-random-characters
 # Text variables:
-CF_ACCESS_TEAM_DOMAIN=your-team.cloudflareaccess.com
-CF_ACCESS_AUD=your-access-application-audience
-ADMIN_EMAILS=admin@example.com
+ADMIN_USERNAME=admin
 # Optional; use your public HTTPS origin in production.
 # APP_ORIGIN=https://chat.example.com
 # DEEPSEEK_API_ORIGIN=https://api.deepseek.com

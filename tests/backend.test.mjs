@@ -1,9 +1,8 @@
 import { test, before, after } from 'node:test'
 import assert from 'node:assert/strict'
 import { DatabaseSync } from 'node:sqlite'
-import { readFileSync, mkdirSync } from 'node:fs'
+import { readFileSync, mkdirSync, readdirSync } from 'node:fs'
 import { build } from 'esbuild'
-import { generateKeyPair, exportJWK, SignJWT } from 'jose'
 
 mkdirSync('test-results', { recursive: true })
 await build({
@@ -19,14 +18,17 @@ await build({
   format: 'esm',
   target: 'es2022',
 })
-const { app, sha256, decryptApiKey, verifyAccessIdentity } =
-  await import('../test-results/backend.mjs')
+const { app, sha256, decryptApiKey } = await import('../test-results/backend.mjs')
 
 // A D1 adapter backed by real SQLite validates queries, constraints and atomic rollback.
 class LocalD1 {
   constructor() {
     this.db = new DatabaseSync(':memory:')
-    this.db.exec(readFileSync('migrations/0001_initial.sql', 'utf8'))
+    for (const file of readdirSync('migrations')
+      .filter((file) => file.endsWith('.sql'))
+      .sort()) {
+      this.db.exec(readFileSync('migrations/' + file, 'utf8'))
+    }
   }
   prepare(sql) {
     const execute = (params, kind) => {
@@ -109,22 +111,15 @@ const env = {
   },
   DEEPSEEK_API_KEY: 'sk-deployment-secret',
   API_KEY_ENCRYPTION_KEY: 'test-encryption-secret-with-more-than-32-characters',
-  CF_ACCESS_TEAM_DOMAIN: 'test-team.cloudflareaccess.com',
-  CF_ACCESS_AUD: 'test-access-aud',
-  ADMIN_EMAILS: 'admin@example.com',
+  ADMIN_USERNAME: 'super_admin',
+  ADMIN_PASSWORD: 'test-super-admin-password',
 }
-let keyPair, jwk
 const originalFetch = globalThis.fetch
 const upstreamCalls = []
 let uploadSequence = 0
 before(async () => {
-  keyPair = await generateKeyPair('RS256')
-  jwk = { ...(await exportJWK(keyPair.publicKey)), kid: 'test-key', alg: 'RS256', use: 'sig' }
   globalThis.fetch = async (input, init) => {
     const url = String(input)
-    if (url === 'https://test-team.cloudflareaccess.com/cdn-cgi/access/certs') {
-      return Response.json({ keys: [jwk] })
-    }
     assert.ok(url.startsWith('https://api.deepseek.com/'), `unexpected outbound URL ${url}`)
     upstreamCalls.push({ url, ...init })
     if (url.endsWith('/files') && init?.method === 'POST') {
@@ -142,16 +137,6 @@ after(() => {
   globalThis.fetch = originalFetch
   db.db.close()
 })
-
-const accessToken = async (options = {}) =>
-  new SignJWT({ email: options.email ?? 'admin@example.com' })
-    .setProtectedHeader({ alg: 'RS256', kid: 'test-key' })
-    .setSubject('admin-subject')
-    .setIssuer('https://test-team.cloudflareaccess.com')
-    .setAudience(options.audience ?? env.CF_ACCESS_AUD)
-    .setIssuedAt()
-    .setExpirationTime(options.expiry ?? '5m')
-    .sign(keyPair.privateKey)
 
 const call = (path, { method = 'GET', body, cookie, headers = {}, csrf = true, origin } = {}) =>
   app.request(
@@ -197,9 +182,10 @@ const register = async (username, code) => {
 }
 let admin, alice, bob
 
-test('auth fails closed; CSRF and administrator Access signatures are enforced', async () => {
+test('auth fails closed; CSRF and environment administrator credentials are enforced', async () => {
   assert.equal((await call('/api/chats')).status, 401)
   assert.equal((await call('/api/admin/users')).status, 401)
+  assert.equal((await call('/admin')).status, 200)
   assert.equal(
     (await call('/api/auth/login', { method: 'POST', csrf: false, body: {} })).status,
     403
@@ -209,35 +195,64 @@ test('auth fails closed; CSRF and administrator Access signatures are enforced',
       .status,
     403
   )
-  assert.equal((await call('/api/admin/access')).status, 401)
+  const credentials = { username: env.ADMIN_USERNAME, password: env.ADMIN_PASSWORD }
   assert.equal(
-    (await call('/api/admin/access', { headers: { 'Cf-Access-Jwt-Assertion': 'forged-token' } }))
-      .status,
+    (await call('/api/admin/login', { method: 'POST', csrf: false, body: credentials })).status,
     403
   )
-  await assert.rejects(verifyAccessIdentity(await accessToken({ audience: 'wrong-aud' }), env))
-  await assert.rejects(
-    verifyAccessIdentity(await accessToken({ email: 'outsider@example.com' }), env)
+  assert.equal(
+    (
+      await call('/api/admin/login', {
+        method: 'POST',
+        origin: 'https://evil.example',
+        body: credentials,
+      })
+    ).status,
+    403
   )
-  await assert.rejects(
-    verifyAccessIdentity(await accessToken({ expiry: Math.floor(Date.now() / 1000) - 60 }), env)
+  assert.equal((await call('/api/admin/access')).status, 401)
+  assert.equal((await call('/api/admin/access/callback')).status, 401)
+  const originalPassword = env.ADMIN_PASSWORD
+  delete env.ADMIN_PASSWORD
+  const unconfigured = await call('/api/admin/login', { method: 'POST', body: credentials })
+  assert.equal(unconfigured.status, 503)
+  assert.equal(db.db.prepare("SELECT COUNT(*) AS n FROM users WHERE role='admin'").get().n, 0)
+  env.ADMIN_PASSWORD = originalPassword
+  assert.equal(
+    (
+      await call('/api/admin/login', {
+        method: 'POST',
+        body: { ...credentials, password: 'incorrect-password' },
+      })
+    ).status,
+    401
   )
-  const entry = await call('/api/admin/access', {
-    headers: { 'Cf-Access-Jwt-Assertion': await accessToken() },
+  assert.equal(
+    (
+      await call('/api/admin/login', {
+        method: 'POST',
+        body: { ...credentials, username: 'wrong-admin' },
+      })
+    ).status,
+    401
+  )
+  assert.equal((await call('/api/auth/login', { method: 'POST', body: credentials })).status, 401)
+  const login = await call('/api/admin/login', {
+    method: 'POST',
+    body: { ...credentials, username: env.ADMIN_USERNAME.toUpperCase() },
   })
-  assert.equal(entry.status, 303)
-  assert.equal(entry.headers.get('Location'), '/api/admin/access/callback')
-  const handoff = cookieFrom(entry, 'deepseek_chat_admin_handoff')
-  assert.equal((await call('/api/admin/access/callback')).status, 200)
-  const login = await call('/api/admin/login', { method: 'POST', cookie: handoff })
-  assert.equal(login.status, 200)
+  assert.equal(login.status, 200, await login.clone().text())
   assert.match(login.headers.get('set-cookie'), /HttpOnly/)
   assert.match(login.headers.get('set-cookie'), /Secure/)
   admin = { cookie: cookieFrom(login), user: (await login.json()).user }
   assert.equal(admin.user.role, 'admin')
-  assert.equal((await call('/api/admin/login', { method: 'POST', cookie: handoff })).status, 401)
+  assert.equal(admin.user.username, env.ADMIN_USERNAME)
+  assert.equal((await call('/api/auth/me', { cookie: admin.cookie })).status, 200)
+  assert.equal(
+    db.db.prepare('SELECT password_hash FROM users WHERE id=?').get(admin.user.id).password_hash,
+    null
+  )
 })
-
 test('invite consumption is bounded and failed registration rolls back usage', async () => {
   const invite = await createInvite(admin.cookie, 2)
   alice = await register('alice', invite.code)
@@ -574,4 +589,135 @@ test('revocation during an in-flight write prevents chats and originals from bei
     db.db.prepare('SELECT COUNT(*) AS n FROM files WHERE user_id=?').get(account.user.id).n,
     0
   )
+})
+
+test('administrator credential changes revoke old sessions and preserve the stable account', async () => {
+  db.db.prepare('DELETE FROM rate_limits').run()
+  const id = admin.user.id
+  const password = env.ADMIN_PASSWORD
+  const username = env.ADMIN_USERNAME
+  const signIn = async () => {
+    const response = await call('/api/admin/login', {
+      method: 'POST',
+      body: { username: env.ADMIN_USERNAME, password: env.ADMIN_PASSWORD },
+    })
+    assert.equal(response.status, 200, await response.clone().text())
+    return { cookie: cookieFrom(response), user: (await response.json()).user }
+  }
+  try {
+    const second = await signIn()
+    env.ADMIN_PASSWORD = 'a-rotated-admin-password'
+    const stale = await call('/api/admin/users', { cookie: admin.cookie })
+    assert.equal(stale.status, 401)
+    assert.equal(stale.headers.get('X-Auth-Expired'), '1')
+    assert.equal(
+      (await call('/api/admin/login', { method: 'POST', body: { username, password } })).status,
+      401
+    )
+    admin = await signIn()
+    assert.equal(admin.user.id, id)
+    assert.equal((await call('/api/admin/users', { cookie: second.cookie })).status, 401)
+    env.ADMIN_USERNAME = 'renamed_admin'
+    assert.equal((await call('/api/admin/users', { cookie: admin.cookie })).status, 401)
+    admin = await signIn()
+    assert.equal(admin.user.id, id)
+    assert.equal(admin.user.username, 'renamed_admin')
+    delete env.ADMIN_PASSWORD
+    assert.equal((await call('/api/admin/users', { cookie: admin.cookie })).status, 401)
+  } finally {
+    env.ADMIN_USERNAME = username
+    env.ADMIN_PASSWORD = password
+    admin = await signIn()
+  }
+})
+
+test('administrator username reservations and collisions cannot promote normal users', async () => {
+  db.db.prepare('DELETE FROM rate_limits').run()
+  const invite = await createInvite(admin.cookie, 2)
+  const reserved = await call('/api/auth/register', {
+    method: 'POST',
+    body: {
+      username: env.ADMIN_USERNAME.toUpperCase(),
+      password: 'normal-user-password',
+      inviteCode: invite.code,
+    },
+  })
+  assert.equal(reserved.status, 409)
+  assert.equal(db.db.prepare('SELECT uses FROM invites WHERE id=?').get(invite.id).uses, 0)
+  const normal = await register('future_admin', invite.code)
+  const username = env.ADMIN_USERNAME
+  try {
+    env.ADMIN_USERNAME = normal.user.username
+    const collision = await call('/api/admin/login', {
+      method: 'POST',
+      body: { username: env.ADMIN_USERNAME, password: env.ADMIN_PASSWORD },
+    })
+    assert.equal(collision.status, 409)
+    assert.equal(
+      db.db.prepare('SELECT role FROM users WHERE id=?').get(normal.user.id).role,
+      'user'
+    )
+    assert.equal((await call('/api/admin/users', { cookie: normal.cookie })).status, 403)
+  } finally {
+    env.ADMIN_USERNAME = username
+  }
+})
+
+test('administrator password attempts are rate limited', async () => {
+  db.db.prepare('DELETE FROM rate_limits').run()
+  for (let i = 0; i < 10; i++) {
+    assert.equal(
+      (
+        await call('/api/admin/login', {
+          method: 'POST',
+          body: { username: env.ADMIN_USERNAME, password: 'incorrect-password' },
+        })
+      ).status,
+      401
+    )
+  }
+  const blocked = await call('/api/admin/login', {
+    method: 'POST',
+    body: { username: env.ADMIN_USERNAME, password: env.ADMIN_PASSWORD },
+  })
+  assert.equal(blocked.status, 429)
+  assert.equal(blocked.headers.get('Retry-After'), '900')
+})
+
+test('administrator migration preserves users and chats and revokes legacy sessions', () => {
+  const legacy = new DatabaseSync(':memory:')
+  try {
+    legacy.exec(readFileSync('migrations/0001_initial.sql', 'utf8'))
+    legacy.exec(`
+      INSERT INTO users (id, username, role, status, created_at, access_sub)
+      VALUES ('old-admin', 'admin@example.com', 'admin', 'active', 1, 'access-sub'),
+             ('old-user', 'existing_user', 'user', 'active', 1, NULL);
+      INSERT INTO auth_sessions (token_hash, user_id, expires_at, created_at)
+      VALUES ('admin-token', 'old-admin', 9999999999999, 1),
+             ('user-token', 'old-user', 9999999999999, 1);
+      INSERT INTO chats (user_id, id, title, created_at, updated_at, data_json)
+      VALUES ('old-admin', 'chat', 'Admin history', 1, 1, '{}'),
+             ('old-user', 'chat', 'User history', 1, 1, '{}');
+      INSERT INTO login_handoffs (token_hash, user_id, expires_at) VALUES ('handoff', 'old-admin', 9);
+    `)
+    legacy.exec(readFileSync('migrations/0002_admin_password.sql', 'utf8'))
+    assert.equal(legacy.prepare('SELECT COUNT(*) AS n FROM users').get().n, 2)
+    assert.equal(legacy.prepare('SELECT COUNT(*) AS n FROM chats').get().n, 2)
+    assert.equal(
+      legacy.prepare("SELECT token_hash FROM auth_sessions WHERE user_id='old-admin'").get(),
+      undefined
+    )
+    assert.equal(
+      legacy
+        .prepare("SELECT admin_credential_hash FROM auth_sessions WHERE user_id='old-user'")
+        .get().admin_credential_hash,
+      null
+    )
+    assert.equal(
+      legacy.prepare("SELECT name FROM sqlite_master WHERE name='login_handoffs'").get(),
+      undefined
+    )
+  } finally {
+    legacy.close()
+  }
 })

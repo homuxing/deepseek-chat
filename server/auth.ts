@@ -3,15 +3,16 @@ import { getCookie, setCookie, deleteCookie } from 'hono/cookie'
 import { HTTPException } from 'hono/http-exception'
 import {
   hashPassword,
+  adminCredentialHash,
+  equalSecret,
   randomToken,
   sha256,
-  verifyAccessIdentity,
   verifyPassword,
 } from './security.js'
-import type { AppEnv, UserRow } from './types.js'
+import type { AppEnv, Bindings, UserRow } from './types.js'
 
 const SESSION_COOKIE = 'deepseek_chat_session'
-const HANDOFF_COOKIE = 'deepseek_chat_admin_handoff'
+const SUPER_ADMIN_ID = 'deepseek-super-admin'
 const SESSION_DURATION = 7 * 24 * 60 * 60 * 1000
 
 export const publicUser = (user: UserRow) => ({
@@ -32,15 +33,37 @@ const sessionCookie = (c: Context<AppEnv>, token: string) =>
     maxAge: SESSION_DURATION / 1000,
   })
 
-const createSession = async (c: Context<AppEnv>, userId: string): Promise<void> => {
+const createSession = async (
+  c: Context<AppEnv>,
+  userId: string,
+  credentialHash: string | null = null
+): Promise<void> => {
   const token = randomToken()
   const now = Date.now()
   await c.env.DB.prepare(
-    'INSERT INTO auth_sessions (token_hash, user_id, expires_at, created_at) VALUES (?, ?, ?, ?)'
+    'INSERT INTO auth_sessions (token_hash, user_id, expires_at, created_at, admin_credential_hash) VALUES (?, ?, ?, ?, ?)'
   )
-    .bind(await sha256(token), userId, now + SESSION_DURATION, now)
+    .bind(await sha256(token), userId, now + SESSION_DURATION, now, credentialHash)
     .run()
   sessionCookie(c, token)
+}
+
+const adminCredentials = (env: Bindings) => {
+  const username = env.ADMIN_USERNAME?.trim().toLowerCase()
+  const password = env.ADMIN_PASSWORD
+  if (
+    !username ||
+    !/^[a-z0-9_-]{3,32}$/.test(username) ||
+    !password ||
+    password.length < 10 ||
+    password.length > 128
+  ) {
+    throw new HTTPException(503, {
+      message:
+        '请配置 ADMIN_USERNAME（3–32 位字母、数字、下划线或短横线）及 ADMIN_PASSWORD（10–128 个字符）',
+    })
+  }
+  return { username, password }
 }
 
 export const requireAuth: MiddlewareHandler<AppEnv> = async (c, next) => {
@@ -48,10 +71,10 @@ export const requireAuth: MiddlewareHandler<AppEnv> = async (c, next) => {
   const tokenHash = token ? await sha256(token) : ''
   const user = token
     ? await c.env.DB.prepare(
-        'SELECT u.* FROM users u JOIN auth_sessions s ON s.user_id = u.id WHERE s.token_hash = ? AND s.expires_at > ? AND u.status = ?'
+        'SELECT u.*, s.admin_credential_hash FROM users u JOIN auth_sessions s ON s.user_id = u.id WHERE s.token_hash = ? AND s.expires_at > ? AND u.status = ?'
       )
         .bind(tokenHash, Date.now(), 'active')
-        .first<UserRow>()
+        .first<UserRow & { admin_credential_hash: string | null }>()
     : null
   if (!user) {
     throw new HTTPException(401, { message: '请先登录，或登录状态已过期' })
@@ -61,13 +84,24 @@ export const requireAuth: MiddlewareHandler<AppEnv> = async (c, next) => {
     c.header('X-Auth-Expired', '1')
     throw new HTTPException(409, { message: '当前账户已在其他页面切换，请刷新后继续' })
   }
-  if (
-    user.role === 'admin' &&
-    !c.env.ADMIN_EMAILS?.split(',').some(
-      (email) => email.trim().toLowerCase() === user.username.toLowerCase()
-    )
-  ) {
-    throw new HTTPException(403, { message: '管理员身份已从部署白名单中移除' })
+  if (user.role === 'admin') {
+    let valid = false
+    try {
+      const credentials = adminCredentials(c.env)
+      valid =
+        user.id === SUPER_ADMIN_ID &&
+        user.username === credentials.username &&
+        equalSecret(
+          user.admin_credential_hash ?? '',
+          await adminCredentialHash(credentials.username, credentials.password)
+        )
+    } catch {
+      valid = false
+    }
+    if (!valid) {
+      await c.env.DB.prepare('DELETE FROM auth_sessions WHERE token_hash = ?').bind(tokenHash).run()
+      throw new HTTPException(401, { message: '管理员配置已变更，请重新登录' })
+    }
   }
   c.set('user', user)
   c.set('sessionTokenHash', tokenHash)
@@ -133,6 +167,9 @@ authRoutes.post('/register', async (c) => {
   await rateLimit(c, 'register', 10)
   const body = await jsonBody(c)
   const username = usernameInput(body.username)
+  if (username === c.env.ADMIN_USERNAME?.trim().toLowerCase()) {
+    throw new HTTPException(409, { message: '该用户名不可注册' })
+  }
   const password = validatePassword(body.password)
   if (
     typeof body.inviteCode !== 'string' ||
@@ -209,60 +246,47 @@ authRoutes.post('/logout', async (c) => {
 
 export const adminLoginRoutes = new Hono<AppEnv>()
 
-adminLoginRoutes.get('/access', async (c) => {
-  const identity = await verifyAccessIdentity(
-    c.req.header('Cf-Access-Jwt-Assertion') ?? getCookie(c, 'CF_Authorization'),
-    c.env
-  )
-  const now = Date.now()
-  await c.env.DB.prepare(
-    "INSERT INTO users (id, username, access_sub, role, status, created_at) VALUES (?, ?, ?, 'admin', 'active', ?) ON CONFLICT(access_sub) DO UPDATE SET username = excluded.username"
-  )
-    .bind(crypto.randomUUID(), identity.email, identity.sub, now)
-    .run()
-  const user = await c.env.DB.prepare('SELECT * FROM users WHERE access_sub = ?')
-    .bind(identity.sub)
-    .first<UserRow>()
-  if (!user || user.status !== 'active') {
-    throw new HTTPException(403, { message: '管理员账户已停用' })
-  }
-  const handoff = randomToken()
-  await c.env.DB.prepare(
-    'INSERT INTO login_handoffs (token_hash, user_id, expires_at) VALUES (?, ?, ?)'
-  )
-    .bind(await sha256(handoff), user.id, now + 120_000)
-    .run()
-  setCookie(c, HANDOFF_COOKIE, handoff, {
-    path: '/api/admin',
-    httpOnly: true,
-    secure: new URL(c.req.url).protocol === 'https:',
-    sameSite: 'Lax',
-    maxAge: 120,
-  })
-  return c.redirect('/api/admin/access/callback', 303)
-})
-
 adminLoginRoutes.post('/login', async (c) => {
-  const handoff = getCookie(c, HANDOFF_COOKIE)
-  deleteCookie(c, HANDOFF_COOKIE, { path: '/api/admin' })
-  if (!handoff) {
-    throw new HTTPException(401, { message: '请重新通过 Cloudflare Access 登录' })
-  }
-  const row = await c.env.DB.prepare(
-    'DELETE FROM login_handoffs WHERE token_hash = ? AND expires_at > ? RETURNING user_id'
+  await rateLimit(c, 'admin-login', 10)
+  const body = await jsonBody(c)
+  const username = usernameInput(body.username)
+  const password = validatePassword(body.password)
+  const credentials = adminCredentials(c.env)
+  const credentialHash = await adminCredentialHash(credentials.username, credentials.password)
+  const valid = equalSecret(
+    await adminCredentialHash(credentials.username, password),
+    credentialHash
   )
-    .bind(await sha256(handoff), Date.now())
-    .first<{ user_id: string }>()
-  const user = row
-    ? await c.env.DB.prepare(
-        "SELECT * FROM users WHERE id = ? AND role = 'admin' AND status = 'active'"
-      )
-        .bind(row.user_id)
-        .first<UserRow>()
-    : null
-  if (!user) {
-    throw new HTTPException(401, { message: '管理员登录凭据已过期' })
+  if (username !== credentials.username || !valid) {
+    throw new HTTPException(401, { message: '用户名或密码错误' })
   }
-  await createSession(c, user.id)
+
+  // Keep one stable administrator identity; never promote an existing normal user.
+  try {
+    await c.env.DB.prepare(
+      "INSERT INTO users (id, username, role, status, created_at) VALUES (?, ?, 'admin', 'active', ?) ON CONFLICT(id) DO UPDATE SET username = excluded.username WHERE users.role = 'admin'"
+    )
+      .bind(SUPER_ADMIN_ID, credentials.username, Date.now())
+      .run()
+  } catch {
+    throw new HTTPException(409, { message: '管理员用户名已被其他账户使用，请更换 ADMIN_USERNAME' })
+  }
+  const user = await c.env.DB.prepare('SELECT * FROM users WHERE id = ?')
+    .bind(SUPER_ADMIN_ID)
+    .first<UserRow>()
+  if (
+    !user ||
+    user.role !== 'admin' ||
+    user.status !== 'active' ||
+    user.username !== credentials.username
+  ) {
+    throw new HTTPException(403, { message: '管理员账户不可用' })
+  }
+  await c.env.DB.prepare(
+    'DELETE FROM auth_sessions WHERE user_id = ? AND (admin_credential_hash IS NULL OR admin_credential_hash != ?)'
+  )
+    .bind(user.id, credentialHash)
+    .run()
+  await createSession(c, user.id, credentialHash)
   return c.json({ user: publicUser(user) })
 })

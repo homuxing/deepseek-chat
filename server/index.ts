@@ -13,8 +13,6 @@ const publicPaths = new Set([
   '/api/auth/register',
   '/api/auth/logout',
   '/api/auth/me',
-  '/api/admin/access',
-  '/api/admin/access/callback',
   '/api/admin/login',
 ])
 
@@ -69,11 +67,6 @@ app.use('/api/*', async (c, next) => {
 app.route('/api/auth', authRoutes)
 app.route('/api/admin', adminLoginRoutes)
 
-// Access protects only the administrator entry path. Its callback renders the frontend and consumes a short-lived handoff via POST.
-app.get('/api/admin/access/callback', (c) =>
-  c.env.ASSETS.fetch(new Request(new URL('/index.html', c.req.url)))
-)
-
 app.use('/api/admin/*', requireAdmin)
 app.route('/api/admin', adminRoutes)
 app.route('/api', dataRoutes)
@@ -103,7 +96,6 @@ const worker: ExportedHandler<AppEnv['Bindings']> = {
     const now = Date.now()
     await env.DB.batch([
       env.DB.prepare('DELETE FROM auth_sessions WHERE expires_at <= ?').bind(now),
-      env.DB.prepare('DELETE FROM login_handoffs WHERE expires_at <= ?').bind(now),
       env.DB.prepare('DELETE FROM rate_limits WHERE window_end <= ?').bind(now),
     ])
   },
