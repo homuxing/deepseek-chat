@@ -182,6 +182,50 @@ const register = async (username, code) => {
 }
 let admin, alice, bob
 
+test('administrator configuration errors identify missing or invalid bindings without exposing values', async () => {
+  const configDb = new LocalD1()
+  const cases = [
+    { ADMIN_USERNAME: undefined, message: /未读取到 ADMIN_USERNAME/ },
+    { ADMIN_USERNAME: '   ', message: /未读取到 ADMIN_USERNAME/ },
+    { ADMIN_USERNAME: 'invalid.username', message: /ADMIN_USERNAME 配置无效/ },
+    { ADMIN_PASSWORD: undefined, message: /未读取到 ADMIN_PASSWORD/ },
+    { ADMIN_PASSWORD: '', message: /未读取到 ADMIN_PASSWORD/ },
+    { ADMIN_PASSWORD: 'short', message: /ADMIN_PASSWORD 配置无效/ },
+    { ADMIN_PASSWORD: 'x'.repeat(129), message: /ADMIN_PASSWORD 配置无效/ },
+  ]
+  try {
+    for (const { message, ...config } of cases) {
+      const response = await app.request(
+        'https://chat.example.com/api/admin/login',
+        {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'X-Requested-With': 'XMLHttpRequest',
+          },
+          body: JSON.stringify({ username: 'super_admin', password: 'a-test-password' }),
+        },
+        { ...env, ...config, DB: configDb }
+      )
+      assert.equal(response.status, 503)
+      const body = await response.json()
+      assert.match(body.error.message, message)
+      assert.ok(!JSON.stringify(body).includes(env.ADMIN_PASSWORD))
+      for (const value of Object.values(config)) {
+        if (typeof value === 'string' && value.trim()) {
+          assert.ok(!JSON.stringify(body).includes(value))
+        }
+      }
+    }
+    assert.equal(
+      configDb.db.prepare("SELECT COUNT(*) AS n FROM users WHERE role='admin'").get().n,
+      0
+    )
+  } finally {
+    configDb.db.close()
+  }
+})
+
 test('auth fails closed; CSRF and environment administrator credentials are enforced', async () => {
   assert.equal((await call('/api/chats')).status, 401)
   assert.equal((await call('/api/admin/users')).status, 401)

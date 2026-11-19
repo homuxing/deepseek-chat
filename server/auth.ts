@@ -49,18 +49,26 @@ const createSession = async (
 }
 
 const adminCredentials = (env: Bindings) => {
-  const username = env.ADMIN_USERNAME?.trim().toLowerCase()
-  const password = env.ADMIN_PASSWORD
-  if (
-    !username ||
-    !/^[a-z0-9_-]{3,32}$/.test(username) ||
-    !password ||
-    password.length < 10 ||
-    password.length > 128
-  ) {
+  if (typeof env.ADMIN_USERNAME !== 'string' || !env.ADMIN_USERNAME.trim()) {
     throw new HTTPException(503, {
-      message:
-        '请配置 ADMIN_USERNAME（3–32 位字母、数字、下划线或短横线）及 ADMIN_PASSWORD（10–128 个字符）',
+      message: '当前 Worker 未读取到 ADMIN_USERNAME，请在生产环境的运行时变量中配置并点击部署',
+    })
+  }
+  const username = env.ADMIN_USERNAME.trim().toLowerCase()
+  if (!/^[a-z0-9_-]{3,32}$/.test(username)) {
+    throw new HTTPException(503, {
+      message: 'ADMIN_USERNAME 配置无效，须为 3–32 位字母、数字、下划线或短横线',
+    })
+  }
+  const password = env.ADMIN_PASSWORD
+  if (typeof password !== 'string' || !password) {
+    throw new HTTPException(503, {
+      message: '当前 Worker 未读取到 ADMIN_PASSWORD，请在生产环境的运行时密钥中配置并点击部署',
+    })
+  }
+  if (password.length < 10 || password.length > 128) {
+    throw new HTTPException(503, {
+      message: 'ADMIN_PASSWORD 配置无效，须为 10–128 个字符；请修改运行时密钥后点击部署',
     })
   }
   return { username, password }
