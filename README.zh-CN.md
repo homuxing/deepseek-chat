@@ -43,7 +43,7 @@ pnpm dev:worker
 - 根目录：仓库根目录（留空）。
 - 构建命令：`pnpm build`。
 - 部署命令：`pnpm deploy:worker`。
-- 构建环境：Node.js 24；如需覆盖自动检测版本，设置构建变量 `NODE_VERSION=24` 和 `PNPM_VERSION=11.5.1`。
+- 构建环境：Node.js 24，pnpm 版本由 `package.json` 中的 `packageManager: pnpm@11.5.1` 固定，GitHub Actions 使用同一版本。如需覆盖 Node.js 自动检测版本，设置构建变量 `NODE_VERSION=24`。
 
 推送到 `main` 后，Cloudflare 构建前端，再执行 `deploy:worker`：先应用尚未执行的远程 D1 迁移，成功后发布 Worker 后端及 `dist` 前端资源。迁移失败时停止发布。构建使用的 Cloudflare API Token 需要该账户的 Workers Scripts、D1 和 R2 权限，其中 D1 需要 Edit 权限才能执行迁移。
 

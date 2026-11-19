@@ -5,6 +5,7 @@
   "license": "MIT",
   "private": true,
   "type": "module",
+  "packageManager": "pnpm@11.5.1",
   "scripts": {
     "dev": "rspack serve -c rspack.config.ts",
     "dev:worker": "wrangler dev",

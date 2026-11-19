@@ -43,7 +43,7 @@ Create a **Worker** in Cloudflare Workers & Pages, connect the `homuxing/deepsee
 - Root directory: repository root (leave blank).
 - Build command: `pnpm build`.
 - Deploy command: `pnpm deploy:worker`.
-- Build environment: Node.js 24. To override detected versions, set build variables `NODE_VERSION=24` and `PNPM_VERSION=11.5.1`.
+- Build environment: Node.js 24. `packageManager: pnpm@11.5.1` in `package.json` pins pnpm for Cloudflare and GitHub Actions. To override the detected Node.js version, set build variable `NODE_VERSION=24`.
 
 On each push to `main`, Cloudflare builds the frontend and runs `deploy:worker`: apply pending remote D1 migrations, then publish the Worker backend and `dist` assets. A failed migration stops deployment. The build's Cloudflare API token needs Workers Scripts, D1 and R2 permissions for the account, including D1 Edit to apply migrations.
 
