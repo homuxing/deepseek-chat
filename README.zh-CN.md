@@ -32,11 +32,33 @@ pnpm dev:worker
 
 `wrangler.jsonc` 已配置 Worker `deepseek-chat`、D1 `chat`（绑定 `DB`）和 R2 `chat`（绑定 `FILES`）。
 
+使用 **Cloudflare Workers** 部署。`pnpm build` 生成 `dist` 前端资源，Wrangler 根据 `main: server/index.ts` 打包后端，并将前后端一起发布。Pages 的 `pnpm build` + `dist` 配置只会发布当前项目的前端，不能运行登录接口。
+
+### Git 自动部署
+
+在 Cloudflare 的 Workers & Pages 中创建 **Worker**，连接 `homuxing/deepseek-chat` 仓库，使用以下设置：
+
+- Worker 名称：`deepseek-chat`，与 `wrangler.jsonc` 保持一致。
+- 生产分支：`main`，启用自动部署。
+- 根目录：仓库根目录（留空）。
+- 构建命令：`pnpm build`。
+- 部署命令：`pnpm deploy:worker`。
+- 构建环境：Node.js 24；如需覆盖自动检测版本，设置构建变量 `NODE_VERSION=24` 和 `PNPM_VERSION=11.5.1`。
+
+推送到 `main` 后，Cloudflare 构建前端，再执行 `deploy:worker`：先应用尚未执行的远程 D1 迁移，成功后发布 Worker 后端及 `dist` 前端资源。迁移失败时停止发布。构建使用的 Cloudflare API Token 需要该账户的 Workers Scripts、D1 和 R2 权限，其中 D1 需要 Edit 权限才能执行迁移。
+
+确认配置中的 D1 数据库 ID 和 R2 桶属于该 Cloudflare 账户；可以复用已有 `chat` 数据库和桶。在新 Worker 的 **运行时** Variables and Secrets 中填写下列配置，Pages 项目的变量不会自动迁移，构建变量也不会提供给运行时。
+
+首次部署后，使用 Worker 默认地址检查：页面应正常打开，未登录请求 `/api/auth/me` 应返回 `401`、`application/json` 和登录提示。随后从旧 Pages 项目移除 `chat.homu.space` 的自定义域名绑定，并在 Worker 的 Domains & Routes 中添加该域名。若配置 `APP_ORIGIN`，设置为 `https://chat.homu.space` 后再使用正式域名登录。确认正式域名可用后，可以删除旧 Pages 项目。
+
+### 本地终端部署
+
 ```sh
 pnpm exec wrangler login
-pnpm db:migrate:remote
 pnpm deploy
 ```
+
+`pnpm deploy` 构建前端、应用远程 D1 迁移，然后将前后端一起发布。
 
 在 Workers & Pages → deepseek-chat → Settings → Variables and Secrets 配置：
 
@@ -48,7 +70,7 @@ pnpm deploy
 
 给 Worker 绑定域名，R2 不开启公共访问。管理员使用 `ADMIN_USERNAME` 和 `ADMIN_PASSWORD` 登录，修改任意一项会使已有管理员会话失效。普通用户不能注册当前管理员用户名。
 
-更新部署前执行 `pnpm db:migrate:remote`。迁移会添加管理员会话校验字段并撤销旧登录方式的管理员会话，保留用户和聊天记录。如曾为站点配置 Cloudflare Access 应用，请将其停用后使用密码登录。
+部署命令会自动执行 `pnpm db:migrate:remote`。管理员密码登录的迁移会添加会话校验字段并撤销旧登录方式的管理员会话，保留用户和聊天记录。如曾为站点配置 Cloudflare Access 应用，请将其停用后使用密码登录。
 
 管理员登录后，打开“设置 → 通用设置 → 管理”创建邀请码和管理用户。
 
@@ -59,10 +81,10 @@ pnpm type
 pnpm lint
 pnpm test
 pnpm build
-pnpm exec wrangler deploy --dry-run
+pnpm deploy:dry-run
 ```
 
-GitHub Actions 在推送、PR 或手动触发时执行这些检查，不自动部署。
+GitHub Actions 在推送、PR 或手动触发时执行这些检查。生产自动部署由 Cloudflare Workers 的 Git 集成执行，使用上面的构建和部署命令。
 
 ## 历史记录
 

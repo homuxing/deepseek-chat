@@ -32,11 +32,33 @@ For frontend hot reload, also run `pnpm dev` and open `http://localhost:8090`. A
 
 `wrangler.jsonc` configures Worker `deepseek-chat`, D1 `chat` (binding `DB`) and R2 `chat` (binding `FILES`).
 
+Deploy with **Cloudflare Workers**. `pnpm build` generates frontend assets in `dist`; Wrangler bundles the backend from `main: server/index.ts` and publishes both together. A Pages project configured with `pnpm build` and output directory `dist` only publishes this project's frontend and cannot run its authentication API.
+
+### Automatic Git deployment
+
+Create a **Worker** in Cloudflare Workers & Pages, connect the `homuxing/deepseek-chat` repository, and configure:
+
+- Worker name: `deepseek-chat`, matching `wrangler.jsonc`.
+- Production branch: `main`, with automatic deployments enabled.
+- Root directory: repository root (leave blank).
+- Build command: `pnpm build`.
+- Deploy command: `pnpm deploy:worker`.
+- Build environment: Node.js 24. To override detected versions, set build variables `NODE_VERSION=24` and `PNPM_VERSION=11.5.1`.
+
+On each push to `main`, Cloudflare builds the frontend and runs `deploy:worker`: apply pending remote D1 migrations, then publish the Worker backend and `dist` assets. A failed migration stops deployment. The build's Cloudflare API token needs Workers Scripts, D1 and R2 permissions for the account, including D1 Edit to apply migrations.
+
+Check that the configured D1 database ID and R2 bucket belong to the account; reuse the existing `chat` database and bucket if applicable. Set the variables listed below in the new Worker's **runtime** Variables and Secrets. Pages variables do not transfer automatically, and build variables are not available at runtime.
+
+After the first deployment, verify the Worker default URL: the page should load, and an unauthenticated request to `/api/auth/me` should return `401`, `application/json`, and a login message. Then remove the `chat.homu.space` custom domain from the old Pages project and add it in the Worker's Domains & Routes. If setting `APP_ORIGIN`, use `https://chat.homu.space` before signing in through the production domain. Once the production domain works, the old Pages project can be deleted.
+
+### Terminal deployment
+
 ```sh
 pnpm exec wrangler login
-pnpm db:migrate:remote
 pnpm deploy
 ```
+
+`pnpm deploy` builds the frontend, applies remote D1 migrations, and publishes the frontend and backend together.
 
 In Workers & Pages → deepseek-chat → Settings → Variables and Secrets, configure:
 
@@ -48,7 +70,7 @@ In Workers & Pages → deepseek-chat → Settings → Variables and Secrets, con
 
 Bind a domain to the Worker and keep R2 public access disabled. The administrator signs in with `ADMIN_USERNAME` and `ADMIN_PASSWORD`. Changing either setting invalidates existing administrator sessions; ordinary users cannot register the configured administrator username.
 
-Apply `pnpm db:migrate:remote` before deploying this update. The migration adds administrator session validation and revokes sessions from the previous login method, preserving users and chats. If you previously configured a Cloudflare Access application for this site, disable it to use password login.
+Deployment runs `pnpm db:migrate:remote` automatically. The administrator password migration adds session validation and revokes sessions from the previous login method, preserving users and chats. If you previously configured a Cloudflare Access application for this site, disable it to use password login.
 
 After administrator login, open Settings → General → Manage to create invitations and manage users.
 
@@ -59,10 +81,10 @@ pnpm type
 pnpm lint
 pnpm test
 pnpm build
-pnpm exec wrangler deploy --dry-run
+pnpm deploy:dry-run
 ```
 
-GitHub Actions runs these checks on pushes and pull requests, or manually. The workflow does not deploy.
+GitHub Actions runs these checks on pushes and pull requests, or manually. Production automatic deployment runs through Cloudflare Workers' Git integration using the build and deploy commands above.
 
 ## History
 
