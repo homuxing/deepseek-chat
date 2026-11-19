@@ -62,7 +62,7 @@ pnpm deploy
 
 In Workers & Pages → deepseek-chat → Settings → Variables and Secrets, configure:
 
-- **Text:** `ADMIN_USERNAME` (3–32 letters, digits, underscores or hyphens; case-insensitive).
+- **Text:** `ADMIN_USERNAME` is set to `Admin` in `wrangler.jsonc` under `vars`. To change it, update the configuration and push (3–32 letters, digits, underscores or hyphens; case-insensitive).
 - **Optional Text:** `APP_ORIGIN` (site origin, e.g. `https://chat.example.com`), `DEEPSEEK_API_ORIGIN` (defaults to `https://api.deepseek.com`).
 - **Secret:** `ADMIN_PASSWORD` (10–128 characters), `DEEPSEEK_API_KEY`, `API_KEY_ENCRYPTION_KEY` (at least 32 random characters; keep a backup).
 

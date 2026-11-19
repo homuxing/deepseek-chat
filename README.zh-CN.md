@@ -62,7 +62,7 @@ pnpm deploy
 
 在 Workers & Pages → deepseek-chat → Settings → Variables and Secrets 配置：
 
-- **Text：** `ADMIN_USERNAME`（3–32 位字母、数字、下划线或短横线，不区分大小写）。
+- **Text：** `ADMIN_USERNAME` 已在 `wrangler.jsonc` 的 `vars` 中设置为 `Admin`。修改用户名时更新该配置并推送（3–32 位字母、数字、下划线或短横线，不区分大小写）。
 - **可选 Text：** `APP_ORIGIN`（站点地址，如 `https://chat.example.com`）、`DEEPSEEK_API_ORIGIN`（默认 `https://api.deepseek.com`）。
 - **Secret：** `ADMIN_PASSWORD`（10–128 个字符）、`DEEPSEEK_API_KEY`、`API_KEY_ENCRYPTION_KEY`（至少 32 个随机字符，妥善备份）。
 
