@@ -39,10 +39,15 @@
   line-height: 18px;
 }
 
-.action {
+.item .action {
   display: none;
   flex-shrink: 0;
   margin-left: 4px;
+
+  /* 菜单挂在 body 上，移入菜单后仍需保留触发按钮的布局以维持定位。 */
+  &[data-open='true'] {
+    display: flex;
+  }
 }
 
 .renameInput {
@@ -60,7 +65,7 @@
 }
 
 @media (hover: none) {
-  .action {
+  .item .action {
     display: flex;
   }
 }

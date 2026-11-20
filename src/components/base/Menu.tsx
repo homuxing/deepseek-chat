@@ -16,9 +16,11 @@ export type MenuOption = {
 export const Menu = ({
   options,
   children,
+  className,
 }: {
   options: MenuOption[]
   children: (props: { open: boolean; toggle: () => void }) => ReactNode
+  className?: string
 }) => {
   const [open, setOpen] = useState(false)
   const close = () => setOpen(false)
@@ -31,7 +33,7 @@ export const Menu = ({
 
   return (
     <>
-      <span ref={anchorRef} className={styles.anchor}>
+      <span ref={anchorRef} className={clsx(styles.anchor, className)} data-open={open}>
         {children({ open, toggle: () => setOpen((value) => !value) })}
       </span>
       {open

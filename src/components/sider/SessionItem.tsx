@@ -56,8 +56,9 @@ export const SessionItem = memo(function SessionItem({
       }}
     >
       <div className={styles.title}>{displayTitle}</div>
-      <div className={styles.action} onClick={(event) => event.stopPropagation()}>
+      <div onClick={(event) => event.stopPropagation()}>
         <Menu
+          className={styles.action}
           options={[
             {
               key: 'rename',
@@ -74,8 +75,14 @@ export const SessionItem = memo(function SessionItem({
             },
           ]}
         >
-          {({ toggle }) => (
-            <IconButton icon={<IconEllipsisOutline16 />} aria-label={t('more')} onClick={toggle} />
+          {({ open, toggle }) => (
+            <IconButton
+              icon={<IconEllipsisOutline16 />}
+              aria-label={t('more')}
+              aria-haspopup="menu"
+              aria-expanded={open}
+              onClick={toggle}
+            />
           )}
         </Menu>
       </div>
