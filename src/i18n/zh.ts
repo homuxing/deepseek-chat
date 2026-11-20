@@ -11,7 +11,7 @@ export const zh = {
   sessionSaveFailed: '对话或附件尚未保存到你的账号，请重试',
   sessionDeleteFailed: '删除对话失败，请重试',
   settings: '设置',
-  appName: 'API 使用 demo',
+  appName: 'Deepseek Chat',
   deleteSessionModalContentTitle: '永久删除对话',
   deleteSessionWithFilesDescription: '删除后，该对话及其中上传的文件将不可恢复。确认删除吗？',
   cancel: '取消',
@@ -115,14 +115,16 @@ export const zh = {
   historyImportConfirm: '确认导入',
   historyImportConfirmTitle: '确认导入历史对话？',
   historyImportConfirmDescription: '上传的历史对话会覆盖你账号中的全部对话记录，是否确认导入？',
-  historyImportDescription: '导入历史对话会覆盖账号中保存的全部对话和附件，支持 DeepSeek 导出的 ZIP 文件。',
+  historyImportDescription:
+    '导入历史对话会覆盖账号中保存的全部对话和附件，支持 DeepSeek 导出的 ZIP 文件。',
   historyImportedOne: '已导入 1 个对话',
   historyImported: '已导入 {count} 个对话',
   historyImportFailed:
     '文件导入失败，可能是文件格式错误或使用了旧版的对话导出 ZIP 文件，请前往 DeepSeek 重新导出历史对话文件后再次导入。',
   historyExportFailed: '导出失败：{message}',
   exportAllLabel: '导出所有历史对话',
-  historyExportDescription: '包含所有历史对话及已保存的图片原件；其他附件仅保留文件信息，不包含 API Key。',
+  historyExportDescription:
+    '包含所有历史对话及已保存的图片原件；其他附件仅保留文件信息，不包含 API Key。',
   exportAllDownload: '下载',
   deleteAllSessions: '删除所有对话',
   deleteAllSessionsModalTitle: '删除后，所有对话都将被清空且无法找回',

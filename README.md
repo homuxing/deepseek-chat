@@ -74,6 +74,10 @@ Deployment runs `pnpm db:migrate:remote` automatically. The administrator passwo
 
 After administrator login, open Settings → General → Manage to create invitations and manage users.
 
+Ordinary sessions last seven days. A successful same-origin request renews a session when no more than one day remains, up to an absolute deadline of 30 days after login. Administrator sessions last one day, renew when no more than six hours remain, and require login again after seven days. Expired sessions require login; renewal does not use background polling.
+
+Password resets, account status updates, and administrator chat cleanup revoke the affected user's sessions. Session creation and renewal check the credential version so an in-flight login cannot bypass revocation. The `0003_session_renewal.sql` migration revokes existing sessions while preserving users and chats; users must sign in again after migration.
+
 ## Validation
 
 ```sh

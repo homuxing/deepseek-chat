@@ -765,3 +765,418 @@ test('administrator migration preserves users and chats and revokes legacy sessi
     legacy.close()
   }
 })
+
+const DAY = 24 * 60 * 60 * 1000
+const sessionRecord = async (cookie) =>
+  db.db
+    .prepare('SELECT * FROM auth_sessions WHERE token_hash = ?')
+    .get(await sha256(cookie.split('=')[1]))
+
+const renewalAccount = async (username) => {
+  db.db.prepare('DELETE FROM rate_limits').run()
+  const invite = await createInvite(admin.cookie)
+  return register(username, invite.code)
+}
+
+const atTime = async (now, action) => {
+  const originalNow = Date.now
+  Date.now = () => now
+  try {
+    return await action()
+  } finally {
+    Date.now = originalNow
+  }
+}
+
+// 在目标 SQL 执行前完成真实的账户操作，模拟密码校验和会话写入之间的并发。
+const beforeStatement = async (matches, action, request) => {
+  const originalPrepare = db.prepare
+  let intercepted = false
+  db.prepare = function (sql) {
+    const statement = originalPrepare.call(this, sql)
+    if (!matches(sql)) {
+      return statement
+    }
+    return {
+      ...statement,
+      bind: (...params) => {
+        const bound = statement.bind(...params)
+        const execute = (kind) => async () => {
+          if (!intercepted) {
+            intercepted = true
+            await action()
+          }
+          return bound[kind]()
+        }
+        return { ...bound, run: execute('run'), first: execute('first') }
+      },
+    }
+  }
+  try {
+    const response = await request()
+    assert.equal(intercepted, true)
+    return response
+  } finally {
+    db.prepare = originalPrepare
+  }
+}
+
+test('password resets, status changes and administrative revocation block an in-flight login', async () => {
+  for (const change of ['password', 'status', 'chats']) {
+    const account = await renewalAccount(`login_race_${change}`)
+    const version = (await sessionRecord(account.cookie)).auth_version
+    const response = await beforeStatement(
+      (sql) => sql.startsWith('INSERT INTO auth_sessions'),
+      async () => {
+        const update = await call(
+          `/api/admin/users/${account.user.id}${change === 'chats' ? '/chats' : ''}`,
+          {
+            method: change === 'chats' ? 'DELETE' : 'PATCH',
+            cookie: admin.cookie,
+            ...(change === 'chats'
+              ? {}
+              : {
+                  body:
+                    change === 'password'
+                      ? { password: 'changed-password' }
+                      : { status: 'disabled' },
+                }),
+          }
+        )
+        assert.equal(update.status, change === 'chats' ? 204 : 200)
+        if (change === 'status') {
+          const enabled = await call(`/api/admin/users/${account.user.id}`, {
+            method: 'PATCH',
+            cookie: admin.cookie,
+            body: { status: 'active' },
+          })
+          assert.equal(enabled.status, 200)
+        }
+      },
+      () =>
+        call('/api/auth/login', {
+          method: 'POST',
+          body: { username: account.user.username, password: 'a-good-password' },
+        })
+    )
+    assert.equal(response.status, 401)
+    assert.equal(response.headers.get('set-cookie'), null)
+    assert.equal(
+      db.db
+        .prepare('SELECT COUNT(*) AS n FROM auth_sessions WHERE user_id = ?')
+        .get(account.user.id).n,
+      0
+    )
+    assert.ok(
+      db.db.prepare('SELECT auth_version FROM users WHERE id = ?').get(account.user.id)
+        .auth_version > version
+    )
+  }
+})
+
+test('sessions remain bound to their credential version even when revocation deletion is omitted', async () => {
+  const account = await renewalAccount('credential_binding')
+  const old = await sessionRecord(account.cookie)
+  db.db.prepare('UPDATE users SET password_hash = password_hash WHERE id = ?').run(account.user.id)
+  assert.ok(await sessionRecord(account.cookie))
+  const response = await call('/api/auth/me', { cookie: account.cookie })
+  assert.equal(response.status, 401)
+  assert.equal(response.headers.get('X-Auth-Expired'), '1')
+  assert.equal((await sessionRecord(account.cookie)).auth_version, old.auth_version)
+})
+
+test('ordinary sessions renew the same token near expiry and keep cookie and server deadlines aligned', async () => {
+  const account = await renewalAccount('sliding_session')
+  const initial = await sessionRecord(account.cookie)
+  assert.equal(initial.expires_at - initial.created_at, 7 * DAY)
+  assert.equal(initial.absolute_expires_at - initial.created_at, 30 * DAY)
+  assert.equal(Buffer.from(account.cookie.split('=')[1], 'base64url').length, 32)
+  await atTime(initial.created_at + 5 * DAY, async () => {
+    const response = await call('/api/auth/me', { cookie: account.cookie })
+    assert.equal(response.status, 200)
+    assert.equal(response.headers.get('set-cookie'), null)
+    assert.equal((await sessionRecord(account.cookie)).expires_at, initial.expires_at)
+  })
+  await atTime(initial.created_at + 6 * DAY, async () => {
+    const responses = await Promise.all(
+      ['/api/auth/me', '/api/chats'].map((path) => call(path, { cookie: account.cookie }))
+    )
+    let renewedCookies = 0
+    for (const response of responses) {
+      assert.equal(response.status, 200)
+      // 并发请求可能在另一请求续期后读取会话，此时不必再次设置 Cookie。
+      if (!response.headers.has('set-cookie')) {
+        continue
+      }
+      renewedCookies++
+      assert.equal(cookieFrom(response), account.cookie)
+      assert.match(response.headers.get('set-cookie'), /Max-Age=604800/)
+      assert.match(response.headers.get('set-cookie'), /HttpOnly/)
+      assert.match(response.headers.get('set-cookie'), /Secure/)
+      assert.match(response.headers.get('set-cookie'), /SameSite=Lax/)
+      assert.ok(
+        response.headers.get('set-cookie').includes(new Date(Date.now() + 7 * DAY).toUTCString())
+      )
+    }
+    assert.ok(renewedCookies >= 1)
+    assert.equal((await sessionRecord(account.cookie)).expires_at, Date.now() + 7 * DAY)
+    assert.equal(
+      (await sessionRecord(account.cookie)).absolute_expires_at,
+      initial.absolute_expires_at
+    )
+    const subsequent = await call('/api/chats', { cookie: account.cookie })
+    assert.equal(subsequent.headers.get('set-cookie'), null)
+  })
+})
+
+test('renewal respects the thirty-day absolute deadline and expired sessions cannot be revived', async () => {
+  const account = await renewalAccount('absolute_deadline')
+  const initial = await sessionRecord(account.cookie)
+  for (const days of [6, 12, 18, 24]) {
+    await atTime(initial.created_at + days * DAY, async () => {
+      const response = await call('/api/auth/me', { cookie: account.cookie })
+      assert.equal(response.status, 200)
+      assert.equal(
+        (await sessionRecord(account.cookie)).expires_at,
+        Math.min(Date.now() + 7 * DAY, initial.absolute_expires_at)
+      )
+    })
+  }
+  await atTime(initial.absolute_expires_at - DAY / 2, async () => {
+    const response = await call('/api/chats', { cookie: account.cookie })
+    assert.equal(response.status, 200)
+    assert.equal(response.headers.get('set-cookie'), null)
+  })
+  await atTime(initial.absolute_expires_at, async () => {
+    const response = await call('/api/auth/me', { cookie: account.cookie })
+    assert.equal(response.status, 401)
+    assert.equal(response.headers.get('set-cookie'), null)
+    assert.equal(response.headers.get('X-Auth-Expired'), '1')
+  })
+  const idle = await renewalAccount('idle_expiration')
+  const idleSession = await sessionRecord(idle.cookie)
+  await atTime(idleSession.expires_at, async () => {
+    assert.equal((await call('/api/chats', { cookie: idle.cookie })).status, 401)
+    assert.equal((await sessionRecord(idle.cookie)).expires_at, idleSession.expires_at)
+  })
+})
+
+test('administrator sessions renew daily, stop after seven days and reject changed credentials', async () => {
+  db.db.prepare('DELETE FROM rate_limits').run()
+  const login = await call('/api/admin/login', {
+    method: 'POST',
+    body: { username: env.ADMIN_USERNAME, password: env.ADMIN_PASSWORD },
+  })
+  const cookie = cookieFrom(login)
+  const initial = await sessionRecord(cookie)
+  assert.equal(initial.expires_at - initial.created_at, DAY)
+  assert.equal(initial.absolute_expires_at - initial.created_at, 7 * DAY)
+  for (let day = 0; day < 8; day++) {
+    await atTime(initial.created_at + day * ((3 * DAY) / 4), async () => {
+      const response = await call('/api/auth/me', { cookie })
+      assert.equal(response.status, 200)
+      if (day > 0) {
+        assert.equal(cookieFrom(response), cookie)
+        assert.match(response.headers.get('set-cookie'), /Max-Age=86400/)
+      }
+    })
+  }
+  await atTime(initial.created_at + 6 * DAY, async () => {
+    const response = await call('/api/admin/users', { cookie })
+    assert.equal(response.status, 200)
+    assert.equal((await sessionRecord(cookie)).expires_at, initial.absolute_expires_at)
+  })
+  await atTime(initial.absolute_expires_at, async () => {
+    assert.equal((await call('/api/auth/me', { cookie })).status, 401)
+  })
+  const originalPassword = env.ADMIN_PASSWORD
+  try {
+    env.ADMIN_PASSWORD = 'changed-administrator-password'
+    await atTime(initial.created_at + DAY / 2, async () => {
+      const response = await call('/api/auth/me', { cookie })
+      assert.equal(response.status, 401)
+      assert.equal(response.headers.get('set-cookie'), null)
+      assert.equal(await sessionRecord(cookie), undefined)
+    })
+  } finally {
+    env.ADMIN_PASSWORD = originalPassword
+  }
+})
+
+test('failed, cross-site and mismatched-account requests do not renew sessions', async () => {
+  const account = await renewalAccount('rejected_renewal')
+  const initial = await sessionRecord(account.cookie)
+  await atTime(initial.created_at + 6 * DAY, async () => {
+    const cases = [
+      ['/api/chats', { method: 'POST', body: {}, csrf: false }, 403],
+      ['/api/auth/me', { headers: { 'X-Chat-User-ID': 'another-account' } }, 409],
+      ['/api/admin/users', {}, 403],
+      ['/api/chats/missing', {}, 404],
+      ['/api/auth/me', { origin: 'https://evil.example' }, 200],
+      ['/api/auth/me', { headers: { 'Sec-Fetch-Site': 'cross-site' } }, 200],
+      ['/api/auth/me', { method: 'HEAD' }, 200],
+    ]
+    for (const [path, options, status] of cases) {
+      const response = await call(path, { ...options, cookie: account.cookie })
+      assert.equal(response.status, status)
+      assert.equal(response.headers.get('set-cookie'), null)
+      assert.equal((await sessionRecord(account.cookie)).expires_at, initial.expires_at)
+    }
+  })
+})
+
+test('logout or a password reset during renewal cannot recreate or extend revoked sessions', async () => {
+  for (const change of ['logout', 'password']) {
+    const account = await renewalAccount(`renewal_race_${change}`)
+    const initial = await sessionRecord(account.cookie)
+    const nearExpiry = Date.now() + DAY / 2
+    db.db
+      .prepare('UPDATE auth_sessions SET expires_at = ? WHERE token_hash = ?')
+      .run(nearExpiry, initial.token_hash)
+    const response = await beforeStatement(
+      (sql) => sql.startsWith('UPDATE auth_sessions SET expires_at'),
+      async () => {
+        const revoked = await call(
+          change === 'logout' ? '/api/auth/logout' : `/api/admin/users/${account.user.id}`,
+          {
+            method: change === 'logout' ? 'POST' : 'PATCH',
+            cookie: change === 'logout' ? account.cookie : admin.cookie,
+            ...(change === 'password' ? { body: { password: 'new-password-for-renewal' } } : {}),
+          }
+        )
+        assert.equal(revoked.status, change === 'logout' ? 204 : 200)
+      },
+      () => call('/api/auth/me', { cookie: account.cookie })
+    )
+    assert.equal(response.status, 401)
+    assert.equal(response.headers.get('set-cookie'), null)
+    assert.equal(await sessionRecord(account.cookie), undefined)
+  }
+})
+
+test('renewal database failures surface as errors without setting a cookie', async () => {
+  const account = await renewalAccount('renewal_failure')
+  const initial = await sessionRecord(account.cookie)
+  db.db
+    .prepare('UPDATE auth_sessions SET expires_at = ? WHERE token_hash = ?')
+    .run(Date.now() + DAY / 2, initial.token_hash)
+  db.beforeExecute = (sql) => {
+    if (sql.startsWith('UPDATE auth_sessions SET expires_at')) {
+      throw new Error('database unavailable')
+    }
+  }
+  try {
+    const response = await call('/api/auth/me', { cookie: account.cookie })
+    assert.equal(response.status, 500)
+    assert.equal(response.headers.get('set-cookie'), null)
+  } finally {
+    db.beforeExecute = undefined
+  }
+  assert.equal((await call('/api/auth/me', { cookie: account.cookie })).status, 200)
+  assert.equal(
+    (await sessionRecord(account.cookie)).absolute_expires_at,
+    initial.absolute_expires_at
+  )
+})
+
+test('a slower concurrent renewal cannot shorten a deadline already extended by another request', async () => {
+  const account = await renewalAccount('concurrent_renewal')
+  const initial = await sessionRecord(account.cookie)
+  const renewalTime = initial.created_at + 6 * DAY
+  await atTime(renewalTime, async () => {
+    let second
+    const first = await beforeStatement(
+      (sql) => sql.startsWith('UPDATE auth_sessions SET expires_at'),
+      async () => {
+        Date.now = () => renewalTime + 1000
+        second = await call('/api/auth/me', { cookie: account.cookie })
+      },
+      () => call('/api/chats', { cookie: account.cookie })
+    )
+    for (const response of [first, second]) {
+      assert.equal(response.status, 200)
+      assert.equal(cookieFrom(response), account.cookie)
+      assert.match(response.headers.get('set-cookie'), /Max-Age=604800/)
+    }
+    assert.equal((await sessionRecord(account.cookie)).expires_at, renewalTime + 1000 + 7 * DAY)
+  })
+})
+
+test('protected writes recheck credential versions and absolute expiration before committing', async () => {
+  for (const change of ['version', 'absolute']) {
+    const account = await renewalAccount(`write_guard_${change}`)
+    const initial = await sessionRecord(account.cookie)
+    db.beforeExecute = (sql) => {
+      if (sql.includes('INSERT INTO chats')) {
+        db.beforeExecute = undefined
+        if (change === 'version') {
+          db.db
+            .prepare('UPDATE users SET password_hash = password_hash WHERE id = ?')
+            .run(account.user.id)
+        } else {
+          db.db
+            .prepare('UPDATE auth_sessions SET absolute_expires_at = ? WHERE token_hash = ?')
+            .run(Date.now() - 1, initial.token_hash)
+        }
+      }
+    }
+    try {
+      const response = await call('/api/chats/shared-id', {
+        method: 'PUT',
+        cookie: account.cookie,
+        body: { session: session() },
+      })
+      assert.equal(response.status, 401)
+      assert.equal(
+        db.db.prepare('SELECT COUNT(*) AS n FROM chats WHERE user_id = ?').get(account.user.id).n,
+        0
+      )
+    } finally {
+      db.beforeExecute = undefined
+    }
+  }
+})
+
+test('streaming chat responses renew the application cookie without forwarding upstream cookies', async () => {
+  const account = await renewalAccount('stream_renewal')
+  const initial = await sessionRecord(account.cookie)
+  await atTime(initial.created_at + 6 * DAY, async () => {
+    const response = await call('/api/anthropic/v1/messages', {
+      method: 'POST',
+      cookie: account.cookie,
+      body: { model: 'deepseek-flash', messages: [{ role: 'user', content: 'Hello' }] },
+    })
+    assert.equal(response.status, 200)
+    assert.equal(response.headers.get('Content-Type'), 'text/event-stream')
+    assert.equal(cookieFrom(response), account.cookie)
+    assert.ok(!response.headers.get('set-cookie').includes('upstream-secret'))
+    assert.match(await response.text(), /message_stop/)
+    assert.equal((await sessionRecord(account.cookie)).expires_at, Date.now() + 7 * DAY)
+  })
+})
+
+test('session migration revokes legacy tokens, preserves data and advances credential versions', () => {
+  const legacy = new DatabaseSync(':memory:')
+  try {
+    legacy.exec(readFileSync('migrations/0001_initial.sql', 'utf8'))
+    legacy.exec(readFileSync('migrations/0002_admin_password.sql', 'utf8'))
+    legacy.exec(`
+      INSERT INTO users (id, username, password_hash, role, status, created_at)
+      VALUES ('legacy-user', 'legacy_user', 'hash', 'user', 'active', 1);
+      INSERT INTO auth_sessions (token_hash, user_id, expires_at, created_at)
+      VALUES ('legacy-token', 'legacy-user', 9999999999999, 1);
+      INSERT INTO chats (user_id, id, title, created_at, updated_at, data_json)
+      VALUES ('legacy-user', 'chat', 'History', 1, 1, '{}');
+    `)
+    legacy.exec(readFileSync('migrations/0003_session_renewal.sql', 'utf8'))
+    assert.equal(legacy.prepare('SELECT COUNT(*) AS n FROM auth_sessions').get().n, 0)
+    assert.equal(legacy.prepare('SELECT COUNT(*) AS n FROM chats').get().n, 1)
+    assert.equal(legacy.prepare('SELECT auth_version FROM users').get().auth_version, 1)
+    legacy.prepare("UPDATE users SET password_hash = 'new-hash', status = 'disabled'").run()
+    assert.equal(legacy.prepare('SELECT auth_version FROM users').get().auth_version, 2)
+    legacy.prepare("UPDATE users SET status = 'active'").run()
+    assert.equal(legacy.prepare('SELECT auth_version FROM users').get().auth_version, 3)
+  } finally {
+    legacy.close()
+  }
+})

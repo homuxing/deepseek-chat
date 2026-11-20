@@ -36,11 +36,7 @@ export const AccountControls = () => {
               <button type="button" className={styles.adminLink} onClick={() => setAdminOpen(true)}>
                 管理
               </button>
-            ) : (
-              <a className={styles.adminLink} href="/admin">
-                管理员登录
-              </a>
-            )}
+            ) : null}
             <button
               type="button"
               className={styles.logout}

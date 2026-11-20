@@ -1,3 +1,26 @@
+.desktop {
+  flex-shrink: 0;
+  width: 261px;
+  height: 100%;
+  overflow: hidden;
+  transition: width var(--ds-transition-duration-slow) var(--ds-ease-in-out);
+}
+
+.desktop > .sider {
+  transition:
+    transform var(--ds-transition-duration-slow) var(--ds-ease-in-out),
+    opacity var(--ds-transition-duration-slow) var(--ds-ease-in-out);
+}
+
+.desktopCollapsed {
+  width: 0;
+}
+
+.desktopCollapsed > .sider {
+  transform: translateX(-100%);
+  opacity: 0;
+}
+
 .sider {
   display: flex;
   flex-direction: column;
@@ -177,6 +200,22 @@
   align-items: center;
   gap: 16px;
   margin: 12px 0 0 16px;
+  opacity: 0;
+  visibility: hidden;
+  pointer-events: none;
+  transform: translateX(-8px);
+  transition:
+    opacity var(--ds-transition-duration-slow) var(--ds-ease-in-out),
+    transform var(--ds-transition-duration-slow) var(--ds-ease-in-out),
+    visibility 0s var(--ds-transition-duration-slow);
+}
+
+.collapsedVisible {
+  opacity: 1;
+  visibility: visible;
+  pointer-events: auto;
+  transform: translateX(0);
+  transition-delay: 0s;
 }
 
 .collapsedGroup {
@@ -198,12 +237,49 @@
   bottom: 0;
   left: 0;
   z-index: 800;
+  visibility: hidden;
+  transform: translateX(-100%);
+  pointer-events: none;
+  transition:
+    transform var(--ds-transition-duration-slow) var(--ds-ease-in-out),
+    visibility 0s var(--ds-transition-duration-slow);
+}
+
+.drawerOpen {
+  visibility: visible;
+  transform: translateX(0);
+  pointer-events: auto;
+  transition-delay: 0s;
 }
 
 .drawerMask {
   position: absolute;
   inset: 0;
   z-index: 799;
+  background-color: rgba(0, 0, 0, 0.18);
+  opacity: 0;
+  visibility: hidden;
+  pointer-events: none;
+  transition:
+    opacity var(--ds-transition-duration-slow) var(--ds-ease-in-out),
+    visibility 0s var(--ds-transition-duration-slow);
+}
+
+.drawerMaskOpen {
+  opacity: 1;
+  visibility: visible;
+  pointer-events: auto;
+  transition-delay: 0s;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .desktop,
+  .desktop > .sider,
+  .collapsed,
+  .drawer,
+  .drawerMask {
+    transition: none;
+  }
 }
 
 .mobile {

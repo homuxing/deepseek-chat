@@ -1,6 +1,7 @@
 import { useEffect, useId, useState, type FormEvent, type ReactNode } from 'react'
 import { adminLogin, initializeAuth, login, register, useAuth } from '../../services/auth.js'
 import { Button } from '../base/Button.js'
+import { PasswordInput } from './PasswordInput.js'
 import styles from './AuthGate.module.css'
 
 export { AccountControls } from './AccountControls.js'
@@ -17,12 +18,14 @@ export const AuthGate = ({ children }: { children: ReactNode }) => {
   )
   const [username, setUsername] = useState('')
   const [password, setPassword] = useState('')
+  const [confirmPassword, setConfirmPassword] = useState('')
   const [inviteCode, setInviteCode] = useState('')
   const [submitting, setSubmitting] = useState(false)
   const [initializing, setInitializing] = useState(true)
   const [submitError, setSubmitError] = useState<string | null>(null)
   const usernameId = useId()
   const passwordId = useId()
+  const confirmPasswordId = useId()
   const inviteId = useId()
   const usernameHintId = useId()
   const passwordHintId = useId()
@@ -43,6 +46,10 @@ export const AuthGate = ({ children }: { children: ReactNode }) => {
   const submit = async (event: FormEvent<HTMLFormElement>) => {
     event.preventDefault()
     if (submitting) {
+      return
+    }
+    if (mode === 'register' && password !== confirmPassword) {
+      setSubmitError('两次输入的密码不一致，请重新输入。')
       return
     }
     setSubmitting(true)
@@ -76,7 +83,7 @@ export const AuthGate = ({ children }: { children: ReactNode }) => {
     )
   }
 
-  if (user && (!adminEntry || user.role === 'admin')) {
+  if (user) {
     return <>{children}</>
   }
 
@@ -106,6 +113,7 @@ export const AuthGate = ({ children }: { children: ReactNode }) => {
                 onClick={() => {
                   setMode(tab)
                   setPassword('')
+                  setConfirmPassword('')
                   setSubmitError(null)
                   useAuth.setState({ error: null })
                 }}
@@ -148,12 +156,12 @@ export const AuthGate = ({ children }: { children: ReactNode }) => {
               </span>
             ) : null}
           </label>
-          <label className={styles.field} htmlFor={passwordId}>
-            <span>密码</span>
-            <input
+          <div className={styles.field}>
+            <label htmlFor={passwordId}>密码</label>
+            <PasswordInput
+              key={mode}
               id={passwordId}
               name="password"
-              type="password"
               value={password}
               autoComplete={mode === 'register' ? 'new-password' : 'current-password'}
               required
@@ -171,7 +179,26 @@ export const AuthGate = ({ children }: { children: ReactNode }) => {
                 10 至 128 个字符
               </span>
             ) : null}
-          </label>
+          </div>
+          {mode === 'register' ? (
+            <div className={styles.field}>
+              <label htmlFor={confirmPasswordId}>确认密码</label>
+              <PasswordInput
+                id={confirmPasswordId}
+                name="confirmPassword"
+                value={confirmPassword}
+                autoComplete="new-password"
+                required
+                minLength={10}
+                maxLength={128}
+                disabled={submitting}
+                onChange={(event) => {
+                  setConfirmPassword(event.target.value)
+                  setSubmitError(null)
+                }}
+              />
+            </div>
+          ) : null}
           {mode === 'register' ? (
             <label className={styles.field} htmlFor={inviteId}>
               <span>邀请码</span>

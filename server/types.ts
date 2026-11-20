@@ -6,6 +6,7 @@ export type UserRow = {
   status: 'active' | 'disabled'
   api_key_ciphertext: string | null
   created_at: number
+  auth_version: number
 }
 
 export type Bindings = {

@@ -95,7 +95,9 @@ const worker: ExportedHandler<AppEnv['Bindings']> = {
   async scheduled(_event, env) {
     const now = Date.now()
     await env.DB.batch([
-      env.DB.prepare('DELETE FROM auth_sessions WHERE expires_at <= ?').bind(now),
+      env.DB.prepare(
+        'DELETE FROM auth_sessions WHERE MIN(expires_at, absolute_expires_at) <= ?'
+      ).bind(now),
       env.DB.prepare('DELETE FROM rate_limits WHERE window_end <= ?').bind(now),
     ])
   },

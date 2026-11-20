@@ -16,7 +16,8 @@ const encoder = new TextEncoder()
 // Recheck inside the write statement, since administrator cleanup may revoke a session during an upload.
 const liveSessionSql = `EXISTS (
   SELECT 1 FROM auth_sessions s JOIN users u ON u.id = s.user_id
-  WHERE s.token_hash = ? AND s.user_id = ? AND s.expires_at > ? AND u.status = 'active'
+  WHERE s.token_hash = ? AND s.user_id = ? AND MIN(s.expires_at, s.absolute_expires_at) > ?
+    AND s.auth_version = u.auth_version AND u.status = 'active'
 )`
 
 type JsonRecord = Record<string, unknown>
@@ -331,6 +332,9 @@ const clearUserChats = async (
     env.DB.prepare('DELETE FROM chats WHERE user_id = ?').bind(userId),
   ]
   if (revokeSessions) {
+    statements.push(
+      env.DB.prepare('UPDATE users SET auth_version = auth_version + 1 WHERE id = ?').bind(userId)
+    )
     statements.push(env.DB.prepare('DELETE FROM auth_sessions WHERE user_id = ?').bind(userId))
   }
   await env.DB.batch(statements)

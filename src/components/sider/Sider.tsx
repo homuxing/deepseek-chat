@@ -1,5 +1,5 @@
 import clsx from 'clsx'
-import { useEffect, useMemo, useState } from 'react'
+import { useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react'
 import { useTranslate } from '../../i18n/index.js'
 import { IconPanelLeftOutline16, IconSettingsOutline16, NewChatIcon } from '../base/icons.js'
 import { setSiderCollapsed } from '../../services/settings.js'
@@ -14,6 +14,34 @@ import { openSettings } from '../settings/settingsDialogState.js'
 import { closeMobileSider, useMobileSider } from './mobileSiderState.js'
 import { SessionItem } from './SessionItem.js'
 import styles from './Sider.module.css'
+
+/** 桌面端保留侧边栏内容，通过宽度与位移过渡保持会话列表和滚动位置。 */
+export const DesktopSider = ({ collapsed }: { collapsed: boolean }) => {
+  const containerRef = useRef<HTMLDivElement>(null)
+  const previousCollapsed = useRef(collapsed)
+
+  useLayoutEffect(() => {
+    const container = containerRef.current
+    if (container) {
+      container.inert = collapsed
+      if (previousCollapsed.current && !collapsed) {
+        container.querySelector<HTMLButtonElement>('[data-sider-toggle]')?.focus()
+      }
+    }
+    previousCollapsed.current = collapsed
+  }, [collapsed])
+
+  return (
+    <div
+      ref={containerRef}
+      id="desktop-sider"
+      className={clsx(styles.desktop, collapsed && styles.desktopCollapsed)}
+      aria-hidden={collapsed}
+    >
+      <Sider />
+    </div>
+  )
+}
 
 /** 展开的侧边栏：名称与收起按钮、开启新对话、按时间分组的会话列表、底部设置；移动端放在抽屉里，收起按钮关闭抽屉 */
 export const Sider = ({ mobile = false }: { mobile?: boolean }) => {
@@ -58,6 +86,9 @@ export const Sider = ({ mobile = false }: { mobile?: boolean }) => {
           icon={<IconPanelLeftOutline16 />}
           tooltip={t('collapseSiderbarButton')}
           tooltipPlacement="bottom"
+          data-sider-toggle
+          aria-expanded={true}
+          aria-controls={mobile ? 'mobile-sider' : 'desktop-sider'}
           onClick={() => (mobile ? closeMobileSider() : setSiderCollapsed(true))}
         />
       </div>
@@ -140,16 +171,51 @@ export const Sider = ({ mobile = false }: { mobile?: boolean }) => {
   )
 }
 
-/** 移动端抽屉：浮在页面上方，点空白区域关闭。 */
+/** 移动端抽屉保留到退出动画结束，隐藏时禁止焦点和点击进入。 */
 export const MobileSider = () => {
   const open = useMobileSider((state) => state.open)
-  if (!open) {
-    return null
-  }
+  const drawerRef = useRef<HTMLDivElement>(null)
+  const previousOpen = useRef(open)
+
+  useLayoutEffect(() => {
+    const drawer = drawerRef.current
+    if (drawer) {
+      drawer.inert = !open
+      if (open && !previousOpen.current) {
+        drawer.querySelector<HTMLButtonElement>('[data-sider-toggle]')?.focus()
+      } else if (!open && previousOpen.current) {
+        document.querySelector<HTMLButtonElement>('[data-mobile-sider-toggle]')?.focus()
+      }
+    }
+    previousOpen.current = open
+  }, [open])
+
+  useEffect(() => {
+    if (!open) {
+      return
+    }
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.key === 'Escape') {
+        closeMobileSider()
+      }
+    }
+    document.addEventListener('keydown', onKeyDown)
+    return () => document.removeEventListener('keydown', onKeyDown)
+  }, [open])
+
   return (
     <>
-      <div className={styles.drawerMask} onClick={closeMobileSider} />
-      <div className={styles.drawer}>
+      <div
+        className={clsx(styles.drawerMask, open && styles.drawerMaskOpen)}
+        aria-hidden="true"
+        onClick={closeMobileSider}
+      />
+      <div
+        ref={drawerRef}
+        id="mobile-sider"
+        className={clsx(styles.drawer, open && styles.drawerOpen)}
+        aria-hidden={!open}
+      >
         <Sider mobile />
       </div>
     </>

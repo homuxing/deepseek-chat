@@ -13,7 +13,17 @@ import type { AppEnv, Bindings, UserRow } from './types.js'
 
 const SESSION_COOKIE = 'deepseek_chat_session'
 const SUPER_ADMIN_ID = 'deepseek-super-admin'
-const SESSION_DURATION = 7 * 24 * 60 * 60 * 1000
+const DAY = 24 * 60 * 60 * 1000
+const sessionPolicy = (role: UserRow['role']) =>
+  role === 'admin'
+    ? { duration: DAY, renewalWindow: DAY / 4, absoluteDuration: 7 * DAY }
+    : { duration: 7 * DAY, renewalWindow: DAY, absoluteDuration: 30 * DAY }
+
+type AuthenticatedSession = UserRow & {
+  admin_credential_hash: string | null
+  session_expires_at: number
+  absolute_expires_at: number
+}
 
 export const publicUser = (user: UserRow) => ({
   id: user.id,
@@ -24,28 +34,50 @@ export const publicUser = (user: UserRow) => ({
   createdAt: user.created_at,
 })
 
-const sessionCookie = (c: Context<AppEnv>, token: string) =>
+const sessionCookie = (c: Context<AppEnv>, token: string, expiresAt: number) =>
   setCookie(c, SESSION_COOKIE, token, {
     httpOnly: true,
     secure: new URL(c.req.url).protocol === 'https:',
     sameSite: 'Lax',
     path: '/',
-    maxAge: SESSION_DURATION / 1000,
+    maxAge: Math.max(0, Math.floor((expiresAt - Date.now()) / 1000)),
+    expires: new Date(expiresAt),
   })
 
 const createSession = async (
   c: Context<AppEnv>,
-  userId: string,
+  user: UserRow,
   credentialHash: string | null = null
 ): Promise<void> => {
   const token = randomToken()
   const now = Date.now()
-  await c.env.DB.prepare(
-    'INSERT INTO auth_sessions (token_hash, user_id, expires_at, created_at, admin_credential_hash) VALUES (?, ?, ?, ?, ?)'
+  const policy = sessionPolicy(user.role)
+  const expiresAt = now + policy.duration
+  // 在同一条 SQL 中检查校验密码时的版本及凭据，避免重置后插入旧凭据会话。
+  const result = await c.env.DB.prepare(
+    `INSERT INTO auth_sessions
+       (token_hash, user_id, expires_at, created_at, admin_credential_hash, auth_version, absolute_expires_at)
+     SELECT ?, id, ?, ?, ?, auth_version, ? FROM users
+     WHERE id = ? AND username = ? AND role = ? AND status = 'active'
+       AND auth_version = ? AND password_hash IS ?`
   )
-    .bind(await sha256(token), userId, now + SESSION_DURATION, now, credentialHash)
+    .bind(
+      await sha256(token),
+      expiresAt,
+      now,
+      credentialHash,
+      now + policy.absoluteDuration,
+      user.id,
+      user.username,
+      user.role,
+      user.auth_version,
+      user.password_hash
+    )
     .run()
-  sessionCookie(c, token)
+  if (result.meta.changes !== 1) {
+    throw new HTTPException(401, { message: '账户凭据或状态已变更，请重新登录' })
+  }
+  sessionCookie(c, token, expiresAt)
 }
 
 const adminCredentials = (env: Bindings) => {
@@ -77,12 +109,16 @@ const adminCredentials = (env: Bindings) => {
 export const requireAuth: MiddlewareHandler<AppEnv> = async (c, next) => {
   const token = getCookie(c, SESSION_COOKIE)
   const tokenHash = token ? await sha256(token) : ''
+  const now = Date.now()
   const user = token
     ? await c.env.DB.prepare(
-        'SELECT u.*, s.admin_credential_hash FROM users u JOIN auth_sessions s ON s.user_id = u.id WHERE s.token_hash = ? AND s.expires_at > ? AND u.status = ?'
+        `SELECT u.*, s.admin_credential_hash, s.expires_at AS session_expires_at, s.absolute_expires_at
+         FROM users u JOIN auth_sessions s ON s.user_id = u.id
+         WHERE s.token_hash = ? AND s.expires_at > ? AND s.absolute_expires_at > ?
+           AND s.auth_version = u.auth_version AND u.status = 'active'`
       )
-        .bind(tokenHash, Date.now(), 'active')
-        .first<UserRow & { admin_credential_hash: string | null }>()
+        .bind(tokenHash, now, now)
+        .first<AuthenticatedSession>()
     : null
   if (!user) {
     throw new HTTPException(401, { message: '请先登录，或登录状态已过期' })
@@ -114,6 +150,39 @@ export const requireAuth: MiddlewareHandler<AppEnv> = async (c, next) => {
   c.set('user', user)
   c.set('sessionTokenHash', tokenHash)
   await next()
+
+  const policy = sessionPolicy(user.role)
+  const origin = c.req.header('Origin')
+  // 仅成功的站内业务请求触发续期，跨站请求、失败响应和退出均不会延长会话。
+  if (
+    !token ||
+    c.res.status < 200 ||
+    c.res.status >= 300 ||
+    ['HEAD', 'OPTIONS'].includes(c.req.method) ||
+    c.req.header('Sec-Fetch-Site') === 'cross-site' ||
+    (origin && origin !== (c.env.APP_ORIGIN || new URL(c.req.url).origin)) ||
+    user.session_expires_at - now > policy.renewalWindow ||
+    user.session_expires_at >= user.absolute_expires_at
+  ) {
+    return
+  }
+  const renewalTime = Date.now()
+  // UPDATE 保留同一个 token，并重新检查撤销、过期及凭据版本；并发续期不会缩短期限。
+  const renewed = await c.env.DB.prepare(
+    `UPDATE auth_sessions SET expires_at = MAX(expires_at, MIN(?, absolute_expires_at))
+     WHERE token_hash = ? AND expires_at > ? AND absolute_expires_at > ?
+       AND auth_version = ? AND EXISTS (
+         SELECT 1 FROM users u WHERE u.id = auth_sessions.user_id
+           AND u.auth_version = auth_sessions.auth_version AND u.status = 'active'
+       )
+     RETURNING expires_at`
+  )
+    .bind(renewalTime + policy.duration, tokenHash, renewalTime, renewalTime, user.auth_version)
+    .first<{ expires_at: number }>()
+  if (!renewed) {
+    throw new HTTPException(401, { message: '登录状态已变更或过期，请重新登录' })
+  }
+  sessionCookie(c, token, renewed.expires_at)
 }
 
 export const requireAdmin: MiddlewareHandler<AppEnv> = async (c, next) => {
@@ -190,6 +259,7 @@ authRoutes.post('/register', async (c) => {
   const id = crypto.randomUUID()
   const token = randomToken()
   const passwordHash = await hashPassword(password)
+  const policy = sessionPolicy('user')
   let result: D1Result[]
   try {
     result = await c.env.DB.batch([
@@ -200,8 +270,9 @@ authRoutes.post('/register', async (c) => {
         "INSERT INTO users (id, username, password_hash, role, status, created_at) SELECT ?, ?, ?, 'user', 'active', ? WHERE changes() = 1"
       ).bind(id, username, passwordHash, now),
       c.env.DB.prepare(
-        'INSERT INTO auth_sessions (token_hash, user_id, expires_at, created_at) SELECT ?, ?, ?, ? WHERE EXISTS (SELECT 1 FROM users WHERE id = ?)'
-      ).bind(await sha256(token), id, now + SESSION_DURATION, now, id),
+        `INSERT INTO auth_sessions (token_hash, user_id, expires_at, created_at, auth_version, absolute_expires_at)
+         SELECT ?, id, ?, ?, auth_version, ? FROM users WHERE id = ?`
+      ).bind(await sha256(token), now + policy.duration, now, now + policy.absoluteDuration, id),
     ])
   } catch {
     throw new HTTPException(409, { message: '注册失败，用户名可能已被使用' })
@@ -213,7 +284,7 @@ authRoutes.post('/register', async (c) => {
   if (!user) {
     throw new HTTPException(500, { message: '注册失败' })
   }
-  sessionCookie(c, token)
+  sessionCookie(c, token, now + policy.duration)
   return c.json({ user: publicUser(user) }, 201)
 })
 
@@ -234,7 +305,7 @@ authRoutes.post('/login', async (c) => {
   if (!user || user.status !== 'active' || !valid) {
     throw new HTTPException(401, { message: '用户名或密码错误，或账户已停用' })
   }
-  await createSession(c, user.id)
+  await createSession(c, user)
   return c.json({ user: publicUser(user) })
 })
 
@@ -295,6 +366,6 @@ adminLoginRoutes.post('/login', async (c) => {
   )
     .bind(user.id, credentialHash)
     .run()
-  await createSession(c, user.id, credentialHash)
+  await createSession(c, user, credentialHash)
   return c.json({ user: publicUser(user) })
 })

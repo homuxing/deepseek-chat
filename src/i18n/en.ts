@@ -10,11 +10,10 @@ export const en = {
   sessionLoading: 'Loading chats...',
   sessionListLoadFailed: 'Unable to load the chat list. Please try again.',
   sessionLoadFailed: 'Unable to load this chat. Please try again.',
-  sessionSaveFailed:
-    'Chats or attachments have not been saved to your account. Please retry.',
+  sessionSaveFailed: 'Chats or attachments have not been saved to your account. Please retry.',
   sessionDeleteFailed: 'Unable to delete this chat. Please try again.',
   settings: 'Settings',
-  appName: 'API usage demo',
+  appName: 'Deepseek Chat',
   deleteSessionModalContentTitle: 'Delete chat?',
   deleteSessionWithFilesDescription:
     'This chat and its uploaded files will be permanently deleted and cannot be recovered. Delete this chat?',
@@ -105,8 +104,7 @@ export const en = {
   avatarMenuSettingsDialogThemeSelectSystemOption: 'System',
   apiKeyStart: 'Enter an API Key to get started',
   apiKeyCustomLabel: 'Custom API Key (optional)',
-  apiKeyFallbackDescription:
-    'Leave this empty to use the API Key configured for this deployment.',
+  apiKeyFallbackDescription: 'Leave this empty to use the API Key configured for this deployment.',
   apiKeyEdit: 'Edit API Key',
   apiKeyPlaceholder: 'Enter API Key',
   apiKeyVerifying: 'Verifying...',
@@ -135,8 +133,7 @@ export const en = {
   exportAllDownload: 'Download',
   deleteAllSessions: 'Delete all chats',
   deleteAllSessionsModalTitle: 'Once deleted, all chats will be cleared and cannot be recovered.',
-  deleteAllSessionsModalDescription:
-    'Stored attachments and unsent drafts will also be deleted.',
+  deleteAllSessionsModalDescription: 'Stored attachments and unsent drafts will also be deleted.',
   historyDeleting: 'Deleting...',
   historyDeleted: 'Successfully deleted.',
   historyDeleteFailed: 'Failed to delete chats. Please try again.',
