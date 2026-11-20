@@ -16,6 +16,7 @@ import {
 } from './BranchSwitcher.js'
 import { MessageFile } from './MessageFile.js'
 import { CopyButton } from './CopyButton.js'
+import { ImagePreview } from '../files/ImagePreview.js'
 import styles from './UserMessage.module.css'
 
 export const UserMessage = memo(function UserMessage({
@@ -41,6 +42,7 @@ export const UserMessage = memo(function UserMessage({
   const t = useTranslate()
   const [editing, setEditing] = useState(false)
   const [draft, setDraft] = useState(message.content)
+  const [previewId, setPreviewId] = useState<string | null>(null)
   const textareaRef = useRef<HTMLTextAreaElement>(null)
   const isMobile = useIsMobile()
   const canSend = !busy && (draft.trim() !== '' || message.files.length > 0)
@@ -73,10 +75,18 @@ export const UserMessage = memo(function UserMessage({
             <MessageFile
               key={file.id}
               file={file}
+              onPreview={() => setPreviewId(file.id)}
               onRetry={retryUploadId ? () => retryUpload(sessionId, retryUploadId) : null}
             />
           ))}
         </div>
+      ) : null}
+      {previewId && message.files.some((file) => file.id === previewId) ? (
+        <ImagePreview
+          files={message.files.filter((file) => file.isImage)}
+          initialId={previewId}
+          onClose={() => setPreviewId(null)}
+        />
       ) : null}
       {editing ? (
         <div className={styles.editor}>

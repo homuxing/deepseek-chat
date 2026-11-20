@@ -168,8 +168,8 @@ export const saveFiles = async (files: StoredFile[]): Promise<void> => {
   await uploadOriginals(files)
 }
 
-export const loadFile = async (id: string): Promise<Blob | undefined> => {
-  const response = await backendFetch(filePath(id))
+export const loadFile = async (id: string, signal?: AbortSignal): Promise<Blob | undefined> => {
+  const response = await backendFetch(filePath(id), { signal })
   if (response.status === 404) {
     return undefined
   }

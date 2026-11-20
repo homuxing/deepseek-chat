@@ -149,7 +149,7 @@ export const MessageList = ({
             {messages.map((message, index) =>
               message.role === 'user' ? (
                 <UserMessage
-                  key={message.id}
+                  key={`${session.id}:${message.id}`}
                   sessionId={session.id}
                   message={message}
                   retryUploadId={uploadRetryId}

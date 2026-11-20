@@ -8,6 +8,11 @@ import { useSettings } from '../settings.js'
 import { appendBranch, getVisibleMessages, normalizeSession, selectVersion } from './branches.js'
 import * as db from './db.js'
 import {
+  clearFileResources,
+  releasePendingFileResources,
+  retainPendingFileResources,
+} from './fileResources.js'
+import {
   clearAllDrafts,
   clearDraft,
   clearSentDraft,
@@ -131,6 +136,7 @@ export const resetChatState = () => {
   sessionAccess.clear()
   unsavedSessions.clear()
   pendingFiles.clear()
+  clearFileResources()
   deletingSessions.clear()
   deletionTasks.clear()
   streamFlushes.clear()
@@ -228,6 +234,9 @@ const persist = (sessionId: string) => {
         }
         if (pendingFiles.get(sessionId) === files) {
           pendingFiles.delete(sessionId)
+          if (files) {
+            releasePendingFileResources(files)
+          }
         }
         if (getSession(sessionId) === session) {
           unsavedSessions.delete(sessionId)
@@ -448,6 +457,7 @@ export const replaceHistory = async (write: () => Promise<void>): Promise<number
     sessionAccess.clear()
     unsavedSessions.clear()
     pendingFiles.clear()
+    clearFileResources()
     clearAllDrafts()
     set({
       ready: true,
@@ -539,7 +549,11 @@ const removeSessionData = async (id: string): Promise<boolean> => {
     sessionLoads.delete(id)
     sessionAccess.delete(id)
     unsavedSessions.delete(id)
+    const files = pendingFiles.get(id)
     pendingFiles.delete(id)
+    if (files) {
+      releasePendingFileResources(files)
+    }
     clearDraft(id)
     set((state) => ({
       sessions: state.sessions.filter((session) => session.id !== id),
@@ -631,16 +645,16 @@ export const sendMessage = (targetSessionId: string | null) => {
     createdAt: now,
   }
   const reply = createReply()
+  // 消息进入界面前交接原件，防止保存尚未完成时读取到 404 并永久失去缩略图。
+  if (files.length > 0) {
+    const originals = files.map(({ id, blob }) => ({ id, blob }))
+    retainPendingFileResources(originals)
+    pendingFiles.set(sessionId, [...(pendingFiles.get(sessionId) ?? []), ...originals])
+  }
   updateSession(sessionId, (session) => ({
     ...appendBranch(session, history.at(-1)?.id ?? null, [question, reply]),
     updatedAt: now,
   }))
-  if (files.length > 0) {
-    pendingFiles.set(sessionId, [
-      ...(pendingFiles.get(sessionId) ?? []),
-      ...files.map(({ id, blob }) => ({ id, blob })),
-    ])
-  }
   persist(sessionId)
   clearSentDraft(targetSessionId)
   void streamReply(sessionId, reply, { history, question })
