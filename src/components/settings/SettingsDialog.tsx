@@ -27,7 +27,12 @@ import {
   useSettings,
   type ThemePreference,
 } from '../../services/settings.js'
-import { useTranslate, type TranslationKey, type TranslationMessage } from '../../i18n/index.js'
+import {
+  translate,
+  useTranslate,
+  type TranslationKey,
+  type TranslationMessage,
+} from '../../i18n/index.js'
 import { Button } from '../base/Button.js'
 import { Modal } from '../base/Modal.js'
 import { Select } from '../base/Select.js'
@@ -35,6 +40,11 @@ import { showToast } from '../base/toastState.js'
 import { ApiKeyConfirm, ApiKeyField, useApiKeyEditor } from './ApiKeyField.js'
 import { AccountControls } from '../auth/AccountControls.js'
 import { closeSettings, useSettingsDialog, type SettingsSection } from './settingsDialogState.js'
+import {
+  isHistoryImportActive,
+  useHistoryImportProgress,
+  type HistoryImportProgress,
+} from '../../services/chat/importProgress.js'
 import styles from './Settings.module.css'
 
 /**
@@ -64,8 +74,10 @@ const SettingsContent = () => {
   const apiKeyEditor = useApiKeyEditor()
   const historyImport = useHistoryImport()
   const historyDelete = useHistoryDelete()
+  const importProgress = useHistoryImportProgress()
   const replacingHistory = useChatStore((state) => state.importingHistory)
-  const historyBusy = historyImport.busy || historyDelete.busy || replacingHistory
+  const historyBusy =
+    isHistoryImportActive(importProgress.phase) || historyDelete.busy || replacingHistory
   return (
     <>
       <Modal
@@ -323,6 +335,7 @@ const ImportConfirm = ({
   historyImport: ReturnType<typeof useHistoryImport>
 }) => {
   const t = useTranslate()
+  const importActive = useHistoryImportProgress((state) => isHistoryImportActive(state.phase))
   return (
     <Modal
       title={t('historyImportConfirmTitle')}
@@ -333,7 +346,12 @@ const ImportConfirm = ({
           <Button variant="outlined" size="m" autoFocus onClick={historyImport.cancel}>
             {t('cancel')}
           </Button>
-          <Button variant="dangerOutlined" size="m" onClick={() => void historyImport.confirm()}>
+          <Button
+            variant="dangerOutlined"
+            size="m"
+            disabled={importActive}
+            onClick={() => void historyImport.confirm()}
+          >
             {t('historyImportConfirm')}
           </Button>
         </>
@@ -441,30 +459,55 @@ const SettingCell = ({
 /** 选文件后先提示覆盖；确认后才检查文件并执行导入，任何错误都提示导入失败。 */
 const useHistoryImport = () => {
   const [file, setFile] = useState<File | null>(null)
-  const [busy, setBusy] = useState(false)
-  const [status, setStatus] = useState<Status>(null)
   const importing = useRef(false)
 
   const confirm = async () => {
-    if (!file || importing.current) {
+    if (
+      !file ||
+      importing.current ||
+      isHistoryImportActive(useHistoryImportProgress.getState().phase)
+    ) {
       return
     }
     importing.current = true
     setFile(null)
-    setBusy(true)
-    setStatus(null)
     try {
-      const count = await importHistory(file)
-      setStatus({ key: count === 1 ? 'historyImportedOne' : 'historyImported', params: { count } })
+      await importHistory(file)
     } catch {
-      setStatus({ key: 'historyImportFailed', error: true })
+      // 导入主流程保存具体错误，关闭弹窗后仍可查看结果。
     } finally {
       importing.current = false
-      setBusy(false)
     }
   }
 
-  return { file, busy, status, select: setFile, cancel: () => setFile(null), confirm }
+  return { file, select: setFile, cancel: () => setFile(null), confirm }
+}
+
+const historyImportStatus = (progress: HistoryImportProgress): Status => {
+  switch (progress.phase) {
+    case 'idle':
+      return null
+    case 'checking':
+      return { key: 'historyImportChecking' }
+    case 'uploading':
+      return {
+        key: 'historyImportUploading',
+        params: { sessions: progress.sessions, files: progress.files },
+      }
+    case 'committing':
+      return { key: 'historyImportCommitting' }
+    case 'done':
+      return progress.sessions === 1
+        ? { key: 'historyImportedOne' }
+        : { key: 'historyImported', params: { count: progress.sessions } }
+    case 'error':
+      return {
+        key: 'historyImportFailed',
+        params: { message: progress.error || translate('unknownError') },
+        error: true,
+      }
+  }
+  return null
 }
 
 /** 导入 = 覆盖：用选中文件替换本地全部会话与附件。 */
@@ -477,12 +520,13 @@ const ImportHistory = ({
 }) => {
   const t = useTranslate()
   const inputRef = useRef<HTMLInputElement>(null)
+  const importProgress = useHistoryImportProgress()
 
   return (
     <SettingCell
       label={t('historyImport')}
       description={t('historyImportDescription')}
-      status={historyImport.status}
+      status={historyImportStatus(importProgress)}
       action={
         <>
           <Button

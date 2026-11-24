@@ -12,6 +12,7 @@ export type UserRow = {
 export type Bindings = {
   DB: D1Database
   FILES: R2Bucket
+  SYNC: DurableObjectNamespace
   ASSETS: Fetcher
   DEEPSEEK_API_KEY: string
   API_KEY_ENCRYPTION_KEY: string

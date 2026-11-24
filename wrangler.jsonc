@@ -21,4 +21,8 @@
     },
   ],
   "r2_buckets": [{ "binding": "FILES", "bucket_name": "chat" }],
+  "durable_objects": {
+    "bindings": [{ "name": "SYNC", "class_name": "HistorySync" }],
+  },
+  "migrations": [{ "tag": "history-sync-v1", "new_sqlite_classes": ["HistorySync"] }],
 }

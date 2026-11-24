@@ -1,4 +1,4 @@
-import { BackupError, fail } from './errors.js'
+import { fail } from './errors.js'
 import {
   EXPORT_FORMAT_VERSION,
   type ChatMessage,
@@ -10,7 +10,7 @@ import {
 } from './format.js'
 
 /**
- * 按格式定义校验，返回只含已定义字段的新对象：容器与元数据严格校验，无法解析的内容片段丢弃。
+ * 按格式定义校验，返回只含已定义字段的新对象：容器、元数据与内容片段均严格校验。
  * 可空字段必须显式为 null；可选字段允许缺省，存在时严格校验。
  */
 
@@ -84,10 +84,16 @@ const searchResult: Read<SearchResult> = (value) => {
   }
 }
 
+/** 文件 ID 会进入 ZIP 路径，必须是单个安全路径片段。 */
+const fileId: Read<string> = (value) => {
+  const id = string(value)
+  return id && !/[/\\]/.test(id) && id !== '.' && id !== '..' ? id : invalid()
+}
+
 const fileEntry: Read<FileEntry> = (value) => {
   const item = record(value)
   return {
-    id: string(item.id),
+    id: fileId(item.id),
     file_name: string(item.file_name),
     file_size: count(item.file_size),
     token_usage: nullable(count)(item.token_usage),
@@ -185,18 +191,6 @@ const readFragment: Read<Fragment> = (value) => {
   }
 }
 
-/** 单个内容片段不兼容不影响其余消息；容器、元数据和后续消息树校验仍严格执行。 */
-const fragment: Read<Fragment | null> = (value) => {
-  try {
-    return readFragment(value)
-  } catch (error) {
-    if (error instanceof BackupError && error.key === 'backupIncomplete') {
-      return null
-    }
-    throw error
-  }
-}
-
 const message: Read<ChatMessage> = (value) => {
   const item = record(value)
   return {
@@ -216,7 +210,7 @@ const message: Read<ChatMessage> = (value) => {
     search_enabled: boolean(item.search_enabled),
     accumulated_token_usage: count(item.accumulated_token_usage),
     inserted_at: time(item.inserted_at),
-    fragments: list(fragment)(item.fragments).filter((item): item is Fragment => item !== null),
+    fragments: list(readFragment)(item.fragments),
   }
 }
 
@@ -242,7 +236,7 @@ export const readSessionIndex: Read<SessionIndexEntry[]> = list((value) => {
   return {
     id: sessionId(item.id),
     title: nullable(string)(item.title),
-    pinned: false,
+    pinned: 'pinned' in item ? boolean(item.pinned) : false,
     message_count: count(item.message_count),
     inserted_at: time(item.inserted_at),
     updated_at: time(item.updated_at),
@@ -254,7 +248,7 @@ export const readSessionFile: Read<SessionFile> = (value) => {
   return {
     id: sessionId(item.id),
     title: nullable(string)(item.title),
-    pinned: false,
+    pinned: 'pinned' in item ? boolean(item.pinned) : false,
     current_message_id: count(item.current_message_id),
     inserted_at: time(item.inserted_at),
     updated_at: time(item.updated_at),

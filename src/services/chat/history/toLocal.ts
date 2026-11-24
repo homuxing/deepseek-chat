@@ -14,12 +14,12 @@ import type {
 } from '../types.js'
 import { fail } from './errors.js'
 import type { ChatMessage, FileEntry, Fragment, SessionFile } from './format.js'
-import { sessionFilesDir } from './paths.js'
+import { parseOriginalPath } from './paths.js'
 
 export type LocalSession = {
   session: Session
-  /** 本会话目录下应存在的图片：ZIP 条目名 → 文件 ID */
-  images: Map<string, string>
+  /** 本会话引用的所有原件：ZIP 条目名 → 文件 ID；缺失原件仍由 session 保留元数据。 */
+  files: Map<string, string>
 }
 
 const time = (value: string) => Date.parse(value)
@@ -39,7 +39,7 @@ const toFile = (file: FileEntry): FileAttachment => ({
   name: file.file_name,
   size: file.file_size,
   isImage: file.is_image,
-  // 图片身份来自归档；原件随后从 ZIP 读取后补充具体 MIME。
+  // MIME 由原件上传侧记录；会话正文保持为空，展示依赖附件类别与文件响应。
   mimeType: '',
 })
 
@@ -278,7 +278,7 @@ const buildTree = (file: SessionFile): Pick<Session, 'messages' | 'rootMessageId
   return { messages, rootMessageId: current.id }
 }
 
-/** 转换单个会话，并列出本会话目录下需要从 ZIP 读取的图片。 */
+/** 转换单个会话，并列出本会话目录下需要从 ZIP 读取的全部原件。 */
 export const toLocalSession = (file: SessionFile): LocalSession => {
   const session: Session = {
     id: file.id,
@@ -286,33 +286,36 @@ export const toLocalSession = (file: SessionFile): LocalSession => {
     title: file.title ?? '',
     createdAt: time(file.inserted_at),
     updatedAt: time(file.updated_at),
+    ...(file.pinned ? { pinned: true } : {}),
     ...buildTree(file),
   }
-  const images = new Map<string, string>()
+  const files = new Map<string, string>()
+  const pathsById = new Map<string, string>()
   for (const message of file.messages) {
     for (const item of message.fragments) {
       if (item.type !== 'FILE') {
         continue
       }
       for (const entry of item.files) {
-        if (!entry.is_image) {
+        if (entry.export_path === null) {
           continue
         }
-        // 读取端把条目名规范为 NFC，引用也按同样规则比较。
-        const path = entry.export_path?.normalize('NFC')
-        if (path === undefined) {
-          continue
-        }
-        // 图片只能在本会话目录下，同一条目不能对应不同文件。
+        // 读取端把条目名规范为 NFC；路径中的会话与文件 ID 必须和引用一致。
+        const path = entry.export_path
+        const original = parseOriginalPath(path)
         if (
-          !path.startsWith(sessionFilesDir(file.id)) ||
-          (images.get(path) ?? entry.id) !== entry.id
+          path !== path.normalize('NFC') ||
+          original?.sessionId !== file.id ||
+          original.fileId !== entry.id ||
+          (files.get(path) ?? entry.id) !== entry.id ||
+          (pathsById.get(entry.id) ?? path) !== path
         ) {
           fail('backupInvalidFiles')
         }
-        images.set(path, entry.id)
+        files.set(path, entry.id)
+        pathsById.set(entry.id, path)
       }
     }
   }
-  return { session, images }
+  return { session, files }
 }

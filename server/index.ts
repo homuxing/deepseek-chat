@@ -3,8 +3,10 @@ import { bodyLimit } from 'hono/body-limit'
 import { HTTPException } from 'hono/http-exception'
 import { authRoutes, adminLoginRoutes, requireAuth, requireAdmin } from './auth.js'
 import { dataRoutes, adminRoutes } from './data.js'
+import { cleanupAbandonedStorage } from './cloudStorage.js'
 import { proxyRoutes } from './proxy.js'
 import type { AppEnv } from './types.js'
+export { HistorySync } from './sync.js'
 
 export const app = new Hono<AppEnv>()
 
@@ -53,11 +55,14 @@ app.use('/api/*', async (c, next) => {
   const fileUpload =
     c.req.method === 'POST' &&
     (/^\/api\/files\/[^/]+$/.test(c.req.path) || c.req.path === '/api/anthropic/v1/files')
-  const size = fileUpload
-    ? 65 * 1024 * 1024
-    : c.req.path === '/api/v1/tools/asr'
-      ? 9 * 1024 * 1024
-      : 1024 * 1024
+  const multipartPart = /^\/api\/storage\/uploads\/[^/]+\/parts\/\d+$/.test(c.req.path)
+  const size = multipartPart
+    ? 10 * 1024 * 1024
+    : fileUpload
+      ? 65 * 1024 * 1024
+      : c.req.path === '/api/v1/tools/asr'
+        ? 9 * 1024 * 1024
+        : 1024 * 1024
   return bodyLimit({
     maxSize: size,
     onError: (ctx) => ctx.json({ error: { message: '请求数据过大' } }, 413),
@@ -65,6 +70,20 @@ app.use('/api/*', async (c, next) => {
 })
 
 app.route('/api/auth', authRoutes)
+app.get('/api/sync', async (c) => {
+  const user = c.get('user')
+  // 浏览器的 WebSocket 无法自定义请求头，查询参数只用于核对页面所属账号。
+  if (c.req.query('user') !== user.id) {
+    throw new HTTPException(409, { message: '当前账号已变更' })
+  }
+  const headers = new Headers(c.req.raw.headers)
+  headers.set('X-Sync-User', user.id)
+  headers.set('X-Sync-Token', c.get('sessionTokenHash'))
+  headers.set('X-Sync-Version', String(user.auth_version))
+  return c.env.SYNC.get(c.env.SYNC.idFromName(user.id)).fetch(
+    new Request('https://sync.internal/connect', { headers })
+  )
+})
 app.route('/api/admin', adminLoginRoutes)
 
 app.use('/api/admin/*', requireAdmin)
@@ -100,6 +119,7 @@ const worker: ExportedHandler<AppEnv['Bindings']> = {
       ).bind(now),
       env.DB.prepare('DELETE FROM rate_limits WHERE window_end <= ?').bind(now),
     ])
+    await cleanupAbandonedStorage(env)
   },
 }
 // eslint-disable-next-line import/no-default-export

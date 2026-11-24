@@ -70,10 +70,14 @@ class LocalD1 {
 
 class LocalR2 {
   objects = new Map()
+  multipartUploads = new Map()
+  sequence = 0
   async put(key, bytes, options) {
     const value =
       bytes instanceof ReadableStream
         ? new Uint8Array(await new Response(bytes).arrayBuffer())
+        : typeof bytes === 'string'
+          ? new TextEncoder().encode(bytes)
         : new Uint8Array(bytes)
     this.objects.set(key, { bytes: value, options })
     await this.afterPut?.(key)
@@ -81,7 +85,16 @@ class LocalR2 {
   }
   async get(key) {
     const value = this.objects.get(key)
-    return value ? { body: value.bytes, size: value.bytes.length } : null
+    if (!value) {
+      return null
+    }
+    const copy = () => new Uint8Array(value.bytes)
+    return {
+      body: copy(),
+      size: value.bytes.length,
+      text: async () => new TextDecoder().decode(value.bytes),
+      arrayBuffer: async () => copy().buffer,
+    }
   }
   async delete(keys) {
     for (const key of Array.isArray(keys) ? keys : [keys]) {
@@ -99,6 +112,67 @@ class LocalR2 {
       ...(truncated ? { cursor: String(offset + selected.length) } : {}),
     }
   }
+  async createMultipartUpload(key, options) {
+    const uploadId = `multipart-${++this.sequence}`
+    this.multipartUploads.set(uploadId, { key, options, parts: new Map() })
+    return this.multipartHandle(key, uploadId)
+  }
+  resumeMultipartUpload(key, uploadId) {
+    const stored = this.multipartUploads.get(uploadId)
+    if (!stored || stored.key !== key) {
+      throw new Error('multipart upload not found')
+    }
+    return this.multipartHandle(key, uploadId)
+  }
+  multipartHandle(key, uploadId) {
+    const stored = () => {
+      const upload = this.multipartUploads.get(uploadId)
+      if (!upload || upload.key !== key) {
+        throw new Error('multipart upload not found')
+      }
+      return upload
+    }
+    return {
+      uploadId,
+      key,
+      uploadPart: async (partNumber, bytes) => {
+        const upload = stored()
+        const value =
+          bytes instanceof ReadableStream
+            ? new Uint8Array(await new Response(bytes).arrayBuffer())
+            : typeof bytes === 'string'
+              ? new TextEncoder().encode(bytes)
+            : new Uint8Array(bytes)
+        const etag = `part-${partNumber}-${value.byteLength}`
+        upload.parts.set(partNumber, { bytes: value, etag })
+        return { partNumber, etag }
+      },
+      complete: async (parts) => {
+        const upload = stored()
+        const chunks = parts.map((part) => {
+          const storedPart = upload.parts.get(part.partNumber)
+          assert.ok(storedPart, `missing part ${part.partNumber}`)
+          assert.equal(storedPart.etag, part.etag)
+          return storedPart.bytes
+        })
+        const size = chunks.reduce((total, chunk) => total + chunk.byteLength, 0)
+        const bytes = new Uint8Array(size)
+        let offset = 0
+        for (const chunk of chunks) {
+          bytes.set(chunk, offset)
+          offset += chunk.byteLength
+        }
+        this.objects.set(key, { bytes, options: upload.options })
+        this.multipartUploads.delete(uploadId)
+        await this.afterPut?.(key)
+        return { size, key }
+      },
+      abort: async () => {
+        stored()
+        this.multipartUploads.delete(uploadId)
+      },
+    }
+  }
 }
 
 const db = new LocalD1()
@@ -113,6 +187,12 @@ const env = {
   API_KEY_ENCRYPTION_KEY: 'test-encryption-secret-with-more-than-32-characters',
   ADMIN_USERNAME: 'super_admin',
   ADMIN_PASSWORD: 'test-super-admin-password',
+  SYNC: {
+    idFromName: (id) => id,
+    get: () => ({
+      fetch: async () => new Response(null, { status: 204 }),
+    }),
+  },
 }
 const originalFetch = globalThis.fetch
 const upstreamCalls = []

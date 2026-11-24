@@ -8,7 +8,7 @@
 
 - 邀请码注册、密码登录。
 - 管理员密码登录，邀请码和用户管理。
-- 按用户保存聊天记录和附件，支持 ZIP 导入导出。
+- 按用户在云端保存聊天记录和附件，支持官方 DeepSeek ZIP 导入导出与多设备自动同步。
 - 自定义 API Key 加密保存，未设置时使用 `DEEPSEEK_API_KEY`。
 - 流式聊天、深度思考、搜索和语音。
 
@@ -30,7 +30,7 @@ pnpm dev:worker
 
 ## 部署
 
-`wrangler.jsonc` 已配置 Worker `deepseek-chat`、D1 `chat`（绑定 `DB`）和 R2 `chat`（绑定 `FILES`）。
+`wrangler.jsonc` 已配置 Worker `deepseek-chat`、D1 `chat`（绑定 `DB`）、私有 R2 `chat`（绑定 `FILES`）和 Durable Object `HistorySync`（绑定 `SYNC`）。D1 保存会话目录与版本，R2 保存完整会话 JSON 和附件原件。
 
 使用 **Cloudflare Workers** 部署。`pnpm build` 生成 `dist` 前端资源，Wrangler 根据 `main: server/index.ts` 打包后端，并将前后端一起发布。Pages 的 `pnpm build` + `dist` 配置只会发布当前项目的前端，不能运行登录接口。
 
@@ -59,6 +59,10 @@ pnpm deploy
 ```
 
 `pnpm deploy` 构建前端、应用远程 D1 迁移，然后将前后端一起发布。
+
+云端历史需要应用 `migrations/0004_cloud_history.sql`。该迁移保留现有用户与会话，添加目录代次、会话版本、R2 正文引用、附件引用，以及导入和 multipart upload 状态记录。现有 D1 会话正文仍可读取，后续写入使用 R2。本地执行 `pnpm db:migrate:local`；`pnpm deploy` 和 `pnpm deploy:worker` 会在发布前应用远程迁移。
+
+保留 `wrangler.jsonc` 中的 `SYNC` Durable Object 绑定，以及 `history-sync-v1` 迁移的 `new_sqlite_classes: ["HistorySync"]`。Wrangler 发布导出 `HistorySync` 类的 Worker 时会同时应用该 DO 迁移。D1 迁移和 DO 部署均需完成，云端历史与多设备自动通知依赖这些配置。
 
 在 Workers & Pages → deepseek-chat → Settings → Variables and Secrets 配置：
 
@@ -92,7 +96,9 @@ GitHub Actions 在推送、PR 或手动触发时执行这些检查。生产自�
 
 ## 历史记录
 
-旧版记录可导出 ZIP 后导入。单次导入最多 200 个会话、1 MiB JSON，单会话最多 900 KiB。详见[历史格式](src/services/chat/history/README.md)。
+支持导入 `export_format_version: 3` 的官方 DeepSeek 历史 ZIP。会话逐条直接上传云端，保留完整消息树、当前分支、正文、思考、搜索结果和置顶属性；图片、文档及其他可取得的附件原件保存至 R2，共享附件在多个会话中保持统一文件标识。缺失原件保留元信息。应用不设置会话数量、单会话 JSON 或总 JSON 的业务容量上限，实际容量受浏览器资源和云服务平台约束。支持 ZIP32 和 ZIP64。
+
+D1 保存当前用户的会话目录、版本与附件引用，R2 保存完整会话 JSON 和原件。上传及归档校验全部成功后才替换历史。使用同一账号的设备通过 Durable Object 通知自动读取最新历史，重新连接和返回页面时也会同步，无需固定轮询或手动刷新。详见[历史格式与云端部署](src/services/chat/history/README.md)。
 
 ## 许可证
 

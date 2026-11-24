@@ -5,8 +5,10 @@ import type { ChatModel, CreateMessageRequest } from '../api/types.js'
 import { extractFileIds, getFileErrorCode, isRetryableApiError } from '../api/errors.js'
 import { cancelUpload, describeUploadError, uploadAttachment, useUploads } from '../attachments.js'
 import { useSettings } from '../settings.js'
+import { translate } from '../../i18n/index.js'
 import { appendBranch, getVisibleMessages, normalizeSession, selectVersion } from './branches.js'
 import * as db from './db.js'
+import { assertBackendIdentity, captureBackendIdentity, type BackendIdentity } from '../backend.js'
 import {
   clearFileResources,
   releasePendingFileResources,
@@ -67,6 +69,11 @@ const titleRequests = new Set<AbortController>()
 type ChatState = {
   ready: boolean
   initError: boolean
+  syncError: string | null
+  syncErrorKind: 'read' | 'action' | null
+  sessionConflictErrors: Record<string, boolean>
+  /** 正在把冲突会话的本地内容另存为副本的会话 */
+  resolvingConflictId: string | null
   /** 历史导入或全部删除期间锁定交互，提交成功前仍展示原有记录。 */
   importingHistory: boolean
   /** 仅列表元数据，按 updatedAt 降序；流式消息更新不会改变此数组。 */
@@ -83,6 +90,10 @@ type ChatState = {
 export const useChatStore = create<ChatState>(() => ({
   ready: false,
   initError: false,
+  syncError: null,
+  syncErrorKind: null,
+  sessionConflictErrors: {},
+  resolvingConflictId: null,
   importingHistory: false,
   sessions: [],
   sessionCache: {},
@@ -95,7 +106,9 @@ export const useChatStore = create<ChatState>(() => ({
 const { getState: get, setState: set } = useChatStore
 
 const sortSessions = (sessions: SessionSummary[]) =>
-  [...sessions].sort((a, b) => b.updatedAt - a.updatedAt)
+  [...sessions].sort(
+    (a, b) => Number(Boolean(b.pinned)) - Number(Boolean(a.pinned)) || b.updatedAt - a.updatedAt
+  )
 
 const getSession = (id: string) => {
   const cache = get().sessionCache
@@ -108,19 +121,48 @@ const getStreamController = (id: string) => {
 }
 
 const sameSummary = (a: SessionSummary, b: SessionSummary) =>
-  a.title === b.title && a.createdAt === b.createdAt && a.updatedAt === b.updatedAt
+  a.title === b.title &&
+  a.createdAt === b.createdAt &&
+  a.updatedAt === b.updatedAt &&
+  a.pinned === b.pinned &&
+  a.revision === b.revision &&
+  a.generation === b.generation
 
 const sessionAccess = new Map<string, number>()
 const unsavedSessions = new Set<string>()
+const conflictedSessions = new Set<string>()
+const saveSequences = new Map<string, number>()
 /** 保存失败时保留原件，重试成功后才释放。 */
 const pendingFiles = new Map<string, db.StoredFile[]>()
 const deletingSessions = new Set<string>()
 const deletionTasks = new Set<Promise<boolean>>()
 const streamFlushes = new Map<string, () => void>()
+/** 冲突副本已写入但最新原会话尚未载入时，重试沿用它，避免重复创建副本。 */
+const conflictCopies = new Map<string, SessionSummary>()
+const conflictResolutionTasks = new Map<string, Promise<boolean>>()
+const renameTasks = new Map<string, Promise<void>>()
 let accessSequence = 0
 let historyEpoch = 0
 let initTask: Promise<void> | undefined
-const sessionLoads = new Map<string, { promise: Promise<void> }>()
+type SessionLoad = {
+  promise: Promise<void>
+  generation?: string
+  revision: number
+  /** 已因响应落后目录而重读一次，避免目录与服务持续不一致时无限请求。 */
+  staleReload: boolean
+}
+const sessionLoads = new Map<string, SessionLoad>()
+
+/** 云端目录为准；本设备尚未保存或处于冲突中的标题和时间继续保留。 */
+const mergeCloudSummaries = (cloud: SessionSummary[], local: SessionSummary[]) => {
+  const merged = new Map(cloud.map((summary) => [summary.id, summary]))
+  for (const summary of local) {
+    if (unsavedSessions.has(summary.id) || conflictedSessions.has(summary.id)) {
+      merged.set(summary.id, summary)
+    }
+  }
+  return sortSessions([...merged.values()])
+}
 
 /** Invalidate pending loads and saves before another identity can use this page. */
 export const resetChatState = () => {
@@ -135,16 +177,27 @@ export const resetChatState = () => {
   clearAllDrafts()
   sessionAccess.clear()
   unsavedSessions.clear()
+  conflictedSessions.clear()
+  saveSequences.clear()
   pendingFiles.clear()
   clearFileResources()
   deletingSessions.clear()
   deletionTasks.clear()
   streamFlushes.clear()
+  conflictCopies.clear()
+  conflictResolutionTasks.clear()
+  renameTasks.clear()
   sessionLoads.clear()
   initTask = undefined
+  historySyncTask = undefined
+  historySyncPending = false
   set({
     ready: false,
     initError: false,
+    syncError: null,
+    syncErrorKind: null,
+    sessionConflictErrors: {},
+    resolvingConflictId: null,
     importingHistory: false,
     sessions: [],
     sessionCache: {},
@@ -221,14 +274,20 @@ const persist = (sessionId: string) => {
   const session = getSession(sessionId)
   if (session) {
     unsavedSessions.add(sessionId)
-    if (deletingSessions.has(sessionId)) {
+    if (
+      get().importingHistory ||
+      deletingSessions.has(sessionId) ||
+      conflictedSessions.has(sessionId)
+    ) {
       return
     }
     const epoch = historyEpoch
+    const sequence = (saveSequences.get(sessionId) ?? 0) + 1
+    saveSequences.set(sessionId, sequence)
     const files = pendingFiles.get(sessionId)
     void db
       .saveSession(session, files)
-      .then(() => {
+      .then((summary) => {
         if (epoch !== historyEpoch || !getSession(sessionId)) {
           return
         }
@@ -238,7 +297,7 @@ const persist = (sessionId: string) => {
             releasePendingFileResources(files)
           }
         }
-        if (getSession(sessionId) === session) {
+        if (saveSequences.get(sessionId) === sequence) {
           unsavedSessions.delete(sessionId)
           set((state) => ({
             sessionSaveErrors: Object.fromEntries(
@@ -247,10 +306,23 @@ const persist = (sessionId: string) => {
           }))
           trimSessionCache()
         }
+        updateSession(sessionId, (current) => ({
+          ...current,
+          revision: summary.revision,
+          generation: summary.generation,
+        }))
       })
       .catch((error: unknown) => {
         db.reportStorageError('save session')(error)
         if (epoch === historyEpoch && getSession(sessionId)) {
+          if (error instanceof Error && 'status' in error && error.status === 409) {
+            conflictedSessions.add(sessionId)
+            // 已确认冲突后停止本轮生成，保留当前本地内容等待用户另存副本。
+            getStreamController(sessionId)?.abort()
+            set((state) => ({
+              sessionConflictErrors: { ...state.sessionConflictErrors, [sessionId]: true },
+            }))
+          }
           set((state) => ({
             sessionSaveErrors: { ...state.sessionSaveErrors, [sessionId]: true },
           }))
@@ -261,7 +333,11 @@ const persist = (sessionId: string) => {
 
 export const retrySaveSessions = () => {
   if (!get().importingHistory) {
-    unsavedSessions.forEach(persist)
+    unsavedSessions.forEach((id) => {
+      if (!conflictedSessions.has(id)) {
+        persist(id)
+      }
+    })
   }
 }
 
@@ -310,25 +386,6 @@ const createReply = (): AssistantMessage => {
   }
 }
 
-/** 仍在生成中的回复（页面关闭或导出时未结束）按「已停止」处理 */
-const settleInterrupted = (session: Session): Session => {
-  if (
-    !session.messages.some(
-      (m) => m.role === 'assistant' && (m.status === 'pending' || m.status === 'streaming')
-    )
-  ) {
-    return session
-  }
-  return {
-    ...session,
-    messages: session.messages.map((m) =>
-      m.role === 'assistant' && (m.status === 'pending' || m.status === 'streaming')
-        ? settleReply(m, 'stopped', session.updatedAt)
-        : m
-    ),
-  }
-}
-
 export const initChat = (): Promise<void> => {
   if (get().ready) {
     return Promise.resolve()
@@ -358,18 +415,35 @@ export const initChat = (): Promise<void> => {
   return initTask
 }
 
-/** 同一会话合并并发读取；切换只改变 activeId，旧请求不会把界面切回去。 */
-const ensureSessionLoaded = (id: string): Promise<void> => {
+/**
+ * 同一版本合并并发读取；目录版本变化时替换旧任务，旧响应不能写入缓存。
+ * 读到的正文比目录旧时丢弃，并立即按当前目录再读一次。
+ */
+const ensureSessionLoaded = (id: string, staleReload = false): Promise<void> => {
   if (getSession(id)) {
     return Promise.resolve()
   }
+  const summary = get().sessions.find((session) => session.id === id)
+  if (!summary) {
+    return Promise.resolve()
+  }
+  const summaryRevision = summary.revision ?? 0
   const pending = sessionLoads.get(id)
-  if (pending) {
+  if (
+    pending &&
+    pending.generation === summary.generation &&
+    pending.revision === summaryRevision
+  ) {
     return pending.promise
   }
   const epoch = historyEpoch
   set((state) => ({ sessionLoadErrors: { ...state.sessionLoadErrors, [id]: false } }))
-  const load = { promise: Promise.resolve() }
+  const load: SessionLoad = {
+    promise: Promise.resolve(),
+    generation: summary.generation,
+    revision: summaryRevision,
+    staleReload,
+  }
   sessionLoads.set(id, load)
   load.promise = (async () => {
     try {
@@ -377,21 +451,48 @@ const ensureSessionLoaded = (id: string): Promise<void> => {
       if (epoch !== historyEpoch || sessionLoads.get(id) !== load) {
         return
       }
-      const summary = get().sessions.find((session) => session.id === id)
-      if (!summary) {
+      const current = get().sessions.find((session) => session.id === id)
+      if (!current) {
         return
       }
       if (!stored) {
         throw new Error(`Session ${id} is missing from local storage`)
       }
-      const settled = settleInterrupted(normalizeSession(stored))
-      // 读取期间可能已在列表重命名，保留最新元数据，不能让旧读取覆盖它。
-      const session = sameSummary(settled, summary) ? settled : { ...settled, ...summary }
+      // 其他设备可能仍在生成，读取不会把远端进行中的回复改写为已停止。
+      const normalized = normalizeSession(stored)
+      const loadedRevision = normalized.revision ?? 0
+      const currentRevision = current.revision ?? 0
+      const sameGeneration = normalized.generation === current.generation
+      const directoryChanged =
+        load.generation !== current.generation || load.revision !== currentRevision
+      const responseStale = !sameGeneration || loadedRevision < currentRevision
+      if (directoryChanged || responseStale) {
+        sessionLoads.delete(id)
+        if (!load.staleReload) {
+          await ensureSessionLoaded(id, true)
+        } else {
+          set((state) => ({
+            sessionLoadErrors: { ...state.sessionLoadErrors, [id]: true },
+          }))
+          db.reportStorageError('read current session version')(
+            new Error('会话正文版本仍落后于当前目录')
+          )
+        }
+        return
+      }
+      const session = normalized
+      // 正文查询与目录来自同一 D1 版本；正文 revision 更高时以正文为准修正目录。
+      if (loadedRevision > currentRevision) {
+        set((state) => ({
+          sessions: sortSessions(
+            state.sessions.map((item) =>
+              item.id === id ? toSessionSummary(normalized) : item
+            )
+          ),
+        }))
+      }
       touchSession(id)
       set((state) => ({ sessionCache: { ...state.sessionCache, [id]: session } }))
-      if (session !== stored) {
-        persist(id)
-      }
       trimSessionCache()
     } catch (error) {
       if (epoch === historyEpoch && sessionLoads.get(id) === load) {
@@ -430,9 +531,20 @@ const waitForIdle = (sessionId?: string) =>
  * 替换历史对话：先写入暂存，成功后原子替换旧记录；写入为空即删除全部会话与附件。
  * 期间停止生成并禁止修改会话；失败时清除暂存，保留原有记录。
  */
-export const replaceHistory = async (write: () => Promise<void>): Promise<number> => {
+export const replaceHistory = async (
+  write: () => Promise<SessionSummary[]>,
+  identity: BackendIdentity = captureBackendIdentity()
+): Promise<number> => {
+  assertBackendIdentity(identity)
   if (get().importingHistory) {
     throw new Error('History replacement is already in progress')
+  }
+  if (
+    conflictedSessions.size > 0 ||
+    conflictResolutionTasks.size > 0 ||
+    get().resolvingConflictId !== null
+  ) {
+    throw new Error('请先处理所有会话冲突，再替换历史')
   }
   set({ importingHistory: true })
   try {
@@ -440,28 +552,49 @@ export const replaceHistory = async (write: () => Promise<void>): Promise<number
       controller.abort()
     }
     // 已开始的单条删除先同步到内存，避免本次替换失败后列表残留已被删除的记录。
-    await Promise.all(deletionTasks)
+    await Promise.allSettled(deletionTasks)
+    // 目录重命名在替换前完成；之后新请求会因 importingHistory 被拒绝。
+    await Promise.allSettled(renameTasks.values())
+    await waitForIdle()
+    // 在版本仍有效时等旧保存结束，期间出现的 409 要保留为冲突而不是被替换清掉。
+    await db.waitForStorageWrites()
+    assertBackendIdentity(identity)
+    if (conflictedSessions.size > 0 || get().resolvingConflictId !== null) {
+      throw new Error('保存期间出现会话冲突，历史未被替换')
+    }
     historyEpoch += 1
     initTask = undefined
     sessionLoads.clear()
-    await waitForIdle()
-    await db.clearStaging()
+    assertBackendIdentity(identity)
+    const epoch = historyEpoch
     let summaries: SessionSummary[]
     try {
-      await write()
-      summaries = await db.commitStaging()
+      summaries = await write()
+      assertBackendIdentity(identity)
+      if (epoch !== historyEpoch) {
+        throw new Error('历史操作已取消')
+      }
     } catch (error) {
       await db.clearStaging().catch(db.reportStorageError('clear unfinished history replacement'))
       throw error
     }
     sessionAccess.clear()
     unsavedSessions.clear()
+    conflictedSessions.clear()
+    conflictCopies.clear()
+    conflictResolutionTasks.clear()
+    renameTasks.clear()
+    saveSequences.clear()
     pendingFiles.clear()
     clearFileResources()
     clearAllDrafts()
     set({
       ready: true,
       initError: false,
+      syncError: null,
+      syncErrorKind: null,
+      sessionConflictErrors: {},
+      resolvingConflictId: null,
       sessions: sortSessions(summaries),
       sessionCache: {},
       sessionLoadErrors: {},
@@ -470,8 +603,13 @@ export const replaceHistory = async (write: () => Promise<void>): Promise<number
     })
     return summaries.length
   } finally {
+    assertBackendIdentity(identity)
     set({ importingHistory: false })
     retrySaveSessions()
+    if (historySyncPending) {
+      historySyncPending = false
+      void synchronizeHistory()
+    }
     const { activeId, ready } = get()
     // 替换失败时恢复被取消的详情读取，原有记录继续可用。
     if (activeId !== null) {
@@ -480,6 +618,83 @@ export const replaceHistory = async (write: () => Promise<void>): Promise<number
       void initChat()
     }
   }
+}
+
+let historySyncTask: Promise<void> | undefined
+let historySyncPending = false
+/** 推送只使干净缓存失效；未保存或生成中的内容保留，版本校验防止覆盖其他设备。 */
+export const synchronizeHistory = (): Promise<void> => {
+  if (get().importingHistory) {
+    historySyncPending = true
+    return Promise.resolve()
+  }
+  if (historySyncTask) {
+    historySyncPending = true
+    return historySyncTask
+  }
+  const identity = captureBackendIdentity()
+  const epoch = historyEpoch
+  const task = (async () => {
+    try {
+      const snapshot = await db.loadHistorySnapshot(identity)
+      assertBackendIdentity(identity)
+      if (epoch !== historyEpoch || get().importingHistory) {
+        return
+      }
+      const state = get()
+      const cloud = new Map(snapshot.sessions.map((summary) => [summary.id, summary]))
+      const cache: Record<string, Session> = {}
+      for (const [id, session] of Object.entries(state.sessionCache)) {
+        const summary = cloud.get(id)
+        if (unsavedSessions.has(id) || Object.hasOwn(state.streaming, id)) {
+          cache[id] = session
+        } else if (
+          summary &&
+          session.revision === summary.revision &&
+          session.generation === summary.generation
+        ) {
+          cache[id] = session
+        }
+      }
+      set({
+        ready: true,
+        initError: false,
+        syncError: null,
+        syncErrorKind: null,
+        sessions: mergeCloudSummaries(snapshot.sessions, state.sessions),
+        sessionCache: cache,
+        activeId:
+          state.activeId !== null && (cloud.has(state.activeId) || cache[state.activeId])
+            ? state.activeId
+            : null,
+      })
+      const activeId = get().activeId
+      if (activeId !== null && !getSession(activeId)) {
+        await ensureSessionLoaded(activeId)
+      }
+    } catch (error) {
+      try {
+        assertBackendIdentity(identity)
+      } catch {
+        return
+      }
+      db.reportStorageError('读取多设备更新')(error)
+      set({
+        syncError: error instanceof Error ? error.message : '无法读取云端更新',
+        syncErrorKind: 'read',
+      })
+    }
+  })()
+  historySyncTask = task
+  return task.finally(() => {
+    if (historySyncTask === task) {
+      historySyncTask = undefined
+    }
+    if (historySyncPending && !get().importingHistory) {
+      historySyncPending = false
+      void synchronizeHistory()
+    }
+  })
 }
 
 export const newChat = () => {
@@ -498,9 +713,13 @@ export const selectSession = (id: string) => {
   }
 }
 
-export const renameSession = (id: string, title: string) => {
-  if (get().importingHistory || deletingSessions.has(id)) {
-    return
+export const renameSession = (id: string, title: string): Promise<void> => {
+  if (
+    get().importingHistory ||
+    deletingSessions.has(id) ||
+    get().resolvingConflictId === id
+  ) {
+    return Promise.resolve()
   }
   const controller = getStreamController(id)
   if (controller) {
@@ -509,13 +728,243 @@ export const renameSession = (id: string, title: string) => {
   if (getSession(id)) {
     updateSession(id, (session) => ({ ...session, title }))
     persist(id)
-  } else {
+    return Promise.resolve()
+  }
+  const previousTask = renameTasks.get(id) ?? Promise.resolve()
+  const task = previousTask
+    .catch(() => {})
+    .then(() => renameUnloadedSession(id, title))
+  renameTasks.set(id, task)
+  void task.finally(() => {
+    if (renameTasks.get(id) === task) {
+      renameTasks.delete(id)
+    }
+  })
+  return task
+}
+
+/**
+ * 未加载详情时先以目录版本提交重命名，再读取最新目录绑定 revision。
+ * 失败时目录保持原样并显式报错，避免界面先把标题改成未保存成功的值。
+ */
+const renameUnloadedSession = async (id: string, title: string): Promise<void> => {
+  const identity = captureBackendIdentity()
+  const epoch = historyEpoch
+  const summary = get().sessions.find((session) => session.id === id)
+  if (!summary) {
+    return
+  }
+  try {
+    await db.renameSession(id, title, summary)
+    assertBackendIdentity(identity)
+    const snapshot = await db.loadHistorySnapshot(identity)
+    assertBackendIdentity(identity)
+    if (epoch !== historyEpoch) {
+      return
+    }
     set((state) => ({
-      sessions: state.sessions.map((session) =>
-        session.id === id ? { ...session, title } : session
-      ),
+      sessions: mergeCloudSummaries(snapshot.sessions, state.sessions),
+      syncError: null,
+      syncErrorKind: null,
     }))
-    void db.renameSession(id, title).catch(db.reportStorageError('rename session'))
+  } catch (error) {
+    try {
+      assertBackendIdentity(identity)
+    } catch {
+      return
+    }
+    if (epoch !== historyEpoch) {
+      return
+    }
+    db.reportStorageError('rename session')(error)
+    set({
+      syncError: error instanceof Error ? error.message : '重命名失败',
+      syncErrorKind: 'action',
+    })
+  }
+}
+
+const preferredConflictId = () => {
+  const state = get()
+  if (state.activeId !== null && state.sessionConflictErrors[state.activeId]) {
+    return state.activeId
+  }
+  return Object.keys(state.sessionConflictErrors).find(
+    (id) => state.sessionConflictErrors[id]
+  ) ?? null
+}
+
+/**
+ * 把冲突会话当前的完整本地快照保存成新云端会话，再载入原会话的云端最新版本。
+ * 副本写入成功前不改动原会话；失败或账号切换时原内容和附件原件继续保留。
+ */
+export const resolveSessionConflict = (sessionId?: string): Promise<boolean> => {
+  if (get().importingHistory) {
+    return Promise.resolve(false)
+  }
+  const id = sessionId ?? preferredConflictId()
+  if (id === null || !conflictedSessions.has(id)) {
+    return Promise.resolve(false)
+  }
+  const existing = conflictResolutionTasks.get(id)
+  if (existing) {
+    return existing
+  }
+  const task = resolveSessionConflictData(id).finally(() => {
+    if (conflictResolutionTasks.get(id) === task) {
+      conflictResolutionTasks.delete(id)
+    }
+  })
+  conflictResolutionTasks.set(id, task)
+  return task
+}
+
+const resolveSessionConflictData = async (sessionId: string): Promise<boolean> => {
+  const identity = captureBackendIdentity()
+  const epoch = historyEpoch
+  set({
+    resolvingConflictId: sessionId,
+    syncError: null,
+    syncErrorKind: null,
+  })
+  try {
+    getStreamController(sessionId)?.abort()
+    await waitForIdle(sessionId)
+    assertBackendIdentity(identity)
+    if (epoch !== historyEpoch) {
+      return false
+    }
+    await db.waitForStorageWrites()
+    assertBackendIdentity(identity)
+    if (epoch !== historyEpoch || !conflictedSessions.has(sessionId)) {
+      return false
+    }
+    const local = getSession(sessionId)
+    if (!local) {
+      throw new Error('冲突会话尚未加载，本地内容未保存')
+    }
+
+    let copySummary = conflictCopies.get(sessionId)
+    if (!copySummary) {
+      // 先读取账号当前 generation，新副本必须写入正在使用的云端历史。
+      const snapshot = await db.loadHistorySnapshot(identity)
+      assertBackendIdentity(identity)
+      if (epoch !== historyEpoch || !conflictedSessions.has(sessionId)) {
+        return false
+      }
+      const latestLocal = getSession(sessionId)
+      if (!latestLocal) {
+        throw new Error('冲突会话尚未加载，本地内容未保存')
+      }
+      const now = Date.now()
+      const copySession: Session = {
+        ...structuredClone(latestLocal),
+        id: createId(),
+        title: translate('conflictCopyTitle', {
+          title: latestLocal.title || translate('untitledChat'),
+        }),
+        createdAt: now,
+        updatedAt: now,
+        revision: undefined,
+        generation: snapshot.generation,
+      }
+      const files = pendingFiles.get(sessionId)
+      const savedCopy = await db.saveSession(copySession, files ?? [])
+      assertBackendIdentity(identity)
+      if (epoch !== historyEpoch) {
+        return false
+      }
+      copySummary = savedCopy
+      copySession.revision = savedCopy.revision
+      copySession.generation = savedCopy.generation
+      conflictCopies.set(sessionId, savedCopy)
+      touchSession(copySession.id)
+      set((state) => ({
+        sessions: sortSessions([
+          savedCopy,
+          ...state.sessions.filter((summary) => summary.id !== savedCopy.id),
+        ]),
+        sessionCache: { ...state.sessionCache, [copySession.id]: copySession },
+      }))
+      // 副本保存时已上传共享原件，此后由云端原件接管预览。
+      if (pendingFiles.get(sessionId) === files) {
+        pendingFiles.delete(sessionId)
+        if (files) {
+          releasePendingFileResources(files)
+        }
+      }
+    }
+
+    const loaded = await db.loadSession(sessionId)
+    assertBackendIdentity(identity)
+    if (epoch !== historyEpoch) {
+      return false
+    }
+    const latest = loaded ? normalizeSession(structuredClone(loaded)) : undefined
+    const copyId = copySummary.id
+    conflictedSessions.delete(sessionId)
+    unsavedSessions.delete(sessionId)
+    saveSequences.delete(sessionId)
+    conflictCopies.delete(sessionId)
+    touchSession(sessionId)
+    set((state) => {
+      const sessions = new Map(state.sessions.map((summary) => [summary.id, summary]))
+      const cache = latest
+        ? { ...state.sessionCache }
+        : Object.fromEntries(
+            Object.entries(state.sessionCache).filter(([id]) => id !== sessionId)
+          )
+      if (latest) {
+        sessions.set(sessionId, toSessionSummary(latest))
+        cache[sessionId] = latest
+      } else {
+        sessions.delete(sessionId)
+      }
+      return {
+        sessions: sortSessions([...sessions.values()]),
+        sessionCache: cache,
+        sessionConflictErrors: Object.fromEntries(
+          Object.entries(state.sessionConflictErrors).filter(([id]) => id !== sessionId)
+        ),
+        sessionSaveErrors: Object.fromEntries(
+          Object.entries(state.sessionSaveErrors).filter(([id]) => id !== sessionId)
+        ),
+        activeId:
+          state.activeId === sessionId ? (latest ? sessionId : copyId) : state.activeId,
+        syncError: null,
+        syncErrorKind: null,
+      }
+    })
+    trimSessionCache()
+    return true
+  } catch (error) {
+    try {
+      assertBackendIdentity(identity)
+    } catch {
+      return false
+    }
+    if (epoch !== historyEpoch) {
+      return false
+    }
+    db.reportStorageError('处理会话冲突')(error)
+    set({
+      syncError: error instanceof Error ? error.message : '无法保留本地副本',
+      syncErrorKind: 'action',
+    })
+    return false
+  } finally {
+    try {
+      assertBackendIdentity(identity)
+      if (epoch === historyEpoch) {
+        set((state) => ({
+          resolvingConflictId:
+            state.resolvingConflictId === sessionId ? null : state.resolvingConflictId,
+        }))
+      }
+    } catch {
+      // 账号切换已由 resetChatState 清空操作状态。
+    }
+    retrySaveSessions()
   }
 }
 
@@ -530,7 +979,11 @@ export const removeSession = (id: string): Promise<boolean> => {
 }
 
 const removeSessionData = async (id: string): Promise<boolean> => {
-  if (get().importingHistory || deletingSessions.has(id)) {
+  if (
+    get().importingHistory ||
+    deletingSessions.has(id) ||
+    get().resolvingConflictId === id
+  ) {
     return false
   }
   const epoch = historyEpoch
@@ -542,7 +995,10 @@ const removeSessionData = async (id: string): Promise<boolean> => {
     if (epoch !== historyEpoch) {
       return false
     }
-    await db.deleteSession(id)
+    await db.deleteSession(
+      id,
+      get().sessions.find((session) => session.id === id)
+    )
     if (epoch !== historyEpoch) {
       return true
     }
@@ -604,7 +1060,11 @@ export const sendMessage = (targetSessionId: string | null) => {
   let sessionId = targetSessionId
   if (
     sessionId !== null &&
-    (deletingSessions.has(sessionId) || getStreamController(sessionId) || !getSession(sessionId))
+    (deletingSessions.has(sessionId) ||
+      conflictedSessions.has(sessionId) ||
+      get().resolvingConflictId === sessionId ||
+      getStreamController(sessionId) ||
+      !getSession(sessionId))
   ) {
     return false
   }
@@ -663,7 +1123,12 @@ export const sendMessage = (targetSessionId: string | null) => {
 
 /** 重新生成当前路径上的回答：在原问题下新增版本，不覆盖旧回答和后续对话。 */
 export const regenerateReply = (sessionId: string, messageId?: string) => {
-  if (get().importingHistory || deletingSessions.has(sessionId)) {
+  if (
+    get().importingHistory ||
+    deletingSessions.has(sessionId) ||
+    conflictedSessions.has(sessionId) ||
+    get().resolvingConflictId === sessionId
+  ) {
     return
   }
   const session = getSession(sessionId)
@@ -689,7 +1154,12 @@ export const regenerateReply = (sessionId: string, messageId?: string) => {
 
 /** 编辑提问后新增同父版本，保留原文件；旧问题的所有回答与后续对话仍可切回。 */
 export const editMessage = (sessionId: string, messageId: string, content: string): boolean => {
-  if (get().importingHistory || deletingSessions.has(sessionId)) {
+  if (
+    get().importingHistory ||
+    deletingSessions.has(sessionId) ||
+    conflictedSessions.has(sessionId) ||
+    get().resolvingConflictId === sessionId
+  ) {
     return false
   }
   const session = getSession(sessionId)
@@ -721,7 +1191,11 @@ export const editMessage = (sessionId: string, messageId: string, content: strin
 }
 
 export const selectMessageVersion = (sessionId: string, messageId: string) => {
-  if (get().importingHistory || deletingSessions.has(sessionId)) {
+  if (
+    get().importingHistory ||
+    deletingSessions.has(sessionId) ||
+    get().resolvingConflictId === sessionId
+  ) {
     return
   }
   if (getStreamController(sessionId)) {
@@ -733,7 +1207,12 @@ export const selectMessageVersion = (sessionId: string, messageId: string) => {
 
 /** 继续最后一条未完成的回答：保留原消息与开关，仅将新流的内容追加到原块之后。 */
 export const continueReply = (sessionId: string, messageId: string) => {
-  if (get().importingHistory || deletingSessions.has(sessionId)) {
+  if (
+    get().importingHistory ||
+    deletingSessions.has(sessionId) ||
+    conflictedSessions.has(sessionId) ||
+    get().resolvingConflictId === sessionId
+  ) {
     return
   }
   const session = getSession(sessionId)
@@ -771,7 +1250,12 @@ export const continueReply = (sessionId: string, messageId: string) => {
 
 /** 附件补传失败后重试：保留原回答位置，重新补传并请求 */
 export const retryUpload = (sessionId: string, messageId: string) => {
-  if (get().importingHistory || deletingSessions.has(sessionId)) {
+  if (
+    get().importingHistory ||
+    deletingSessions.has(sessionId) ||
+    conflictedSessions.has(sessionId) ||
+    get().resolvingConflictId === sessionId
+  ) {
     return
   }
   const session = getSession(sessionId)
@@ -799,7 +1283,7 @@ type Request = { history: Message[]; question: UserMessage; prefix?: AssistantMe
 
 /** 把补传得到的 serverId 写回会话里所有引用同一附件的消息（编辑、重新生成会共用附件） */
 const saveServerIds = (sessionId: string, serverIds: Map<string, string>) => {
-  if (serverIds.size === 0) {
+  if (serverIds.size === 0 || get().resolvingConflictId === sessionId) {
     return
   }
   updateSession(sessionId, (session) => ({

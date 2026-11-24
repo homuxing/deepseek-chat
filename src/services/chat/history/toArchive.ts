@@ -12,8 +12,8 @@ import type {
   SessionIndexEntry,
 } from './format.js'
 
-/** 返回图片原件在 ZIP 里的条目名；无原件或非图片附件返回 null，仅导出元数据。 */
-export type ExportImage = (file: { id: string; name: string; isImage: boolean }) => string | null
+/** 返回原件在 ZIP 里的条目名；无原件的附件返回 null，仅导出元数据。 */
+export type ExportFile = (file: { id: string; name: string; isImage: boolean }) => string | null
 
 const iso = (ms: number) => new Date(ms).toISOString()
 
@@ -23,7 +23,7 @@ const isoOrNull = (value: string | null) => {
   return Number.isFinite(ms) ? iso(ms) : null
 }
 
-const userFragments = (message: UserMessage, exportImage: ExportImage): Fragment[] => {
+const userFragments = (message: UserMessage, exportFile: ExportFile): Fragment[] => {
   const files = message.files.map((file): FileEntry => {
     const isImage = file.isImage
     return {
@@ -32,7 +32,7 @@ const userFragments = (message: UserMessage, exportImage: ExportImage): Fragment
       file_size: file.size,
       token_usage: null,
       inserted_at: iso(message.createdAt),
-      export_path: exportImage({ id: file.id, name: file.name, isImage }),
+      export_path: exportFile({ id: file.id, name: file.name, isImage }),
       is_image: isImage,
       width: null,
       height: null,
@@ -206,27 +206,47 @@ const contextTokens = ({ usage }: AssistantMessage) =>
       usage.output_tokens
     : 0
 
-/** 消息按父节点优先重新编号为 1…n，保证 parent_id 小于 id。 */
+/** 消息按父节点优先重新编号为 1…n；使用显式栈支持长会话。 */
 const numberMessages = (messages: Message[]) => {
   const byId = new Map(messages.map((message) => [message.id, message]))
   const ids = new Map<string, number>()
   const ordered: Message[] = []
-  const visit = (message: Message, depth: number) => {
-    if (ids.has(message.id)) {
-      return
+  const pending = new Map<string, 'visiting' | 'complete'>()
+  const visit = (start: Message) => {
+    const stack: { message: Message; expanded: boolean }[] = [{ message: start, expanded: false }]
+    while (stack.length > 0) {
+      const current = stack.pop()
+      if (!current) {
+        break
+      }
+      const { message, expanded } = current
+      const state = pending.get(message.id)
+      if (state === 'complete') {
+        continue
+      }
+      if (expanded) {
+        pending.set(message.id, 'complete')
+        ids.set(message.id, ordered.push(message))
+        continue
+      }
+      if (state === 'visiting') {
+        fail('backupInvalidBranches')
+      }
+      pending.set(message.id, 'visiting')
+      stack.push({ message, expanded: true })
+      if (message.parentId) {
+        stack.push({
+          message: byId.get(message.parentId) ?? fail('backupInvalidBranches'),
+          expanded: false,
+        })
+      }
     }
-    if (message.parentId) {
-      const parent = byId.get(message.parentId)
-      // 父节点缺失或成环时数据已损坏。
-      visit(parent && depth < messages.length ? parent : fail('backupInvalidBranches'), depth + 1)
-    }
-    ids.set(message.id, ordered.push(message))
   }
-  messages.forEach((message) => visit(message, 0))
+  messages.forEach(visit)
   return { ordered, ids }
 }
 
-export const toSessionFile = (original: Session, exportImage: ExportImage): SessionFile => {
+export const toSessionFile = (original: Session, exportFile: ExportFile): SessionFile => {
   const session = normalizeSession(original)
   const { ordered, ids } = numberMessages(session.messages)
   const id = (message: Message) => ids.get(message.id) ?? fail('backupInvalidBranches')
@@ -252,14 +272,14 @@ export const toSessionFile = (original: Session, exportImage: ExportImage): Sess
       accumulated_token_usage: message.role === 'user' ? 0 : contextTokens(message),
       inserted_at: iso(message.createdAt),
       fragments:
-        message.role === 'user' ? userFragments(message, exportImage) : assistantFragments(message),
+        message.role === 'user' ? userFragments(message, exportFile) : assistantFragments(message),
     }
   })
   const current = getVisibleMessages(session).at(-1)
   return {
     id: session.id,
     title: session.title || null,
-    pinned: false,
+    pinned: session.pinned ?? false,
     // 格式要求非空；空会话没有消息可指向，写 0。
     current_message_id: current ? id(current) : 0,
     inserted_at: iso(session.createdAt),
@@ -271,7 +291,7 @@ export const toSessionFile = (original: Session, exportImage: ExportImage): Sess
 export const toIndexEntry = (file: SessionFile): SessionIndexEntry => ({
   id: file.id,
   title: file.title,
-  pinned: false,
+  pinned: file.pinned,
   message_count: file.messages.length,
   inserted_at: file.inserted_at,
   updated_at: file.updated_at,

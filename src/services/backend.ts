@@ -2,10 +2,32 @@
 export const API_ORIGIN = '/api'
 
 let backendUserId: string | null = null
+let backendIdentityEpoch = 0
+const identityListeners = new Set<() => void>()
+
+export type BackendIdentity = { userId: string | null; epoch: number }
+export const captureBackendIdentity = (): BackendIdentity => ({
+  userId: backendUserId,
+  epoch: backendIdentityEpoch,
+})
+export const assertBackendIdentity = (identity: BackendIdentity): void => {
+  if (identity.userId !== backendUserId || identity.epoch !== backendIdentityEpoch) {
+    throw new BackendError('登录账号已变更，操作已取消', 409)
+  }
+}
+export const onBackendIdentityChange = (listener: () => void): (() => void) => {
+  identityListeners.add(listener)
+  return () => identityListeners.delete(listener)
+}
 
 /** Keep requests pinned to the account shown by the current application state. */
 export const setBackendUserId = (id: string | null): void => {
+  if (backendUserId === id) {
+    return
+  }
+  backendIdentityEpoch++
   backendUserId = id
+  identityListeners.forEach((listener) => listener())
 }
 
 export const getBackendUserId = (): string | null => backendUserId
@@ -83,7 +105,14 @@ const notifyAuthExpired = (path: string) => {
  * Fetch a first-party backend route with cookies and CSRF protection.
  * Non-2xx responses are returned so callers can handle expected 404s.
  */
-export const backendFetch = async (path: string, init: RequestInit = {}): Promise<Response> => {
+export const backendFetch = async (
+  path: string,
+  init: RequestInit = {},
+  identity?: BackendIdentity
+): Promise<Response> => {
+  if (identity) {
+    assertBackendIdentity(identity)
+  }
   if (!path.startsWith(`${API_ORIGIN}/`)) {
     throw new Error(`Backend paths must start with ${API_ORIGIN}/`)
   }
@@ -105,6 +134,9 @@ export const backendFetch = async (path: string, init: RequestInit = {}): Promis
     credentials: 'same-origin',
   }
   const response = await fetch(path, requestInit as RequestInit)
+  if (identity) {
+    assertBackendIdentity(identity)
+  }
   if (response.headers.get('X-Auth-Expired') === '1') {
     notifyAuthExpired(path)
   }
@@ -112,8 +144,12 @@ export const backendFetch = async (path: string, init: RequestInit = {}): Promis
 }
 
 /** Fetch and parse a JSON response, throwing the backend's nested error message. */
-export const apiJson = async <T>(path: string, init: RequestInit = {}): Promise<T> => {
-  const response = await backendFetch(path, init)
+export const apiJson = async <T>(
+  path: string,
+  init: RequestInit = {},
+  identity?: BackendIdentity
+): Promise<T> => {
+  const response = await backendFetch(path, init, identity)
   if (!response.ok) {
     throw await backendResponseError(response)
   }
@@ -121,6 +157,9 @@ export const apiJson = async <T>(path: string, init: RequestInit = {}): Promise<
     return undefined as T
   }
   const text = await response.text()
+  if (identity) {
+    assertBackendIdentity(identity)
+  }
   if (!text) {
     return undefined as T
   }

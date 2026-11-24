@@ -10,22 +10,36 @@ Deepseek Chat 使用 `export_format_version: 3` 的历史会话 ZIP，导出文�
 manifest.json                                      格式版本，必须是首个条目
 chat_sessions/{session_id}.json                    全部会话 JSON（含消息树）
 chat_session_index.json                            会话索引
-chat_sessions/{session_id}_files/{file_id}_{file_name}  全部图片原件
+chat_sessions/{session_id}_files/{file_id}_{file_name}  图片、文档等附件原件
 ```
 
-导入也支持“会话 JSON → 该会话图片”交错排列、索引在末尾的顺序。`user.json` 可位于 manifest 与会话之间，导入时跳过；本项目不导出账号信息。图片按 `FILE.export_path` 匹配。
+导入要求 `manifest.json` 是首个文件条目，其后的会话 JSON、索引、原件和可选的 `user.json` 可按任意合法顺序排列。原件可以先于会话，索引可以前置或位于末尾。`user.json` 只检查 ZIP 完整性后跳过；本项目不导出账号信息。所有附件原件均按 `FILE.export_path` 匹配。
 
-可选字段允许缺省；时间接受以 `Z` 结尾、带可选小数秒的 UTC 时间。校验后只保留已定义字段，未知类型或无法解析的内容片段直接丢弃；容器和元数据字段不合法仍会导致导入失败。
+可选字段允许缺省，`pinned` 缺省为 `false`；时间接受以 `Z` 结尾、带可选小数秒的 UTC 时间。字段校验保留已定义的数据；未知片段类型、无法解析的正文、损坏容器及不合法元数据均导致导入失败。
+
+同一文件 ID 可以由多个会话引用，在各自的会话目录使用不同 `export_path`。同一会话内同 ID 必须对应同一路径。多个目录中的原件副本必须字节一致，导入以分块内容指纹验证后仅保存一次；重复 ZIP 路径、重复会话或消息 ID、冲突文件映射及未被引用的原件都会导致失败。
 
 ## 导入与替换
 
 1. 用户确认覆盖后，先读取首个条目检查格式与版本；不符合时直接失败，不中止正在生成的回答。
-2. 检查通过后停止生成，导入期间禁止修改会话。会话和原件在内存中暂存，按 `FILE.is_image` 保留图片身份并回填 MIME。图片按文件 ID 去重；字节识别仅补充具体 MIME，无法识别时仍按图片处理。
-3. 校验索引、消息树和 ZIP 完整性后，为原件生成新 ID 并上传 R2，再用 D1 batch 原子替换当前用户的会话。失败不会覆盖旧原件；成功后清理不再引用的原件。单次导入最多 200 个会话、1 MiB JSON，单会话最多 900 KiB。暂存会在完成、失败或刷新后清理。
+2. 检查通过后停止生成，导入期间禁止修改会话。解析器逐会话转换并交给云端 sink 上传完整 JSON，原件到达时上传 R2；内存只保留当前会话或原件、会话 ID、索引计数、原件映射及内容指纹。sink 为附件生成新 ID，同一旧 ID 的全部引用共用新 ID，支持原件先于会话。
+3. 会话和原件上传至当前账号的独立导入代次，完成全部索引、消息树、附件映射和 ZIP 完整性校验后，才以 D1 事务切换当前目录。失败保留原有历史，取消并清理未完成导入；成功后清理旧代次及未引用原件。应用不设置会话数量、单会话正文或总 JSON 的业务容量上限，实际容量受浏览器资源和云服务平台约束。
 
 消息树以 `id` / `parent_id` 还原，父消息 ID 必须小于子消息 ID、角色交替、根为提问。`current_message_id` 决定当前分支；其他节点默认选中 ID 最大的子消息。缺失原件的附件保留文件名和大小，不进入后续请求；有原件的导入图片在首次用于请求时上传。
 
-导入时一次性转换为正式消息，正文、思考用时、模板标识、工具结果与阅读链接签名都保存在本地消息字段中，不保留原始消息副本。展示、请求与导出统一读取这份消息。只支持当前数据格式，不提供旧数据库迁移。
+导入时逐会话转换为正式消息，正文、思考用时、模板标识、工具结果与阅读链接签名保存在完整会话 JSON 中，不保留原始归档消息副本。展示、请求与导出统一读取正式消息。D1 保存会话目录、标题、时间、置顶、版本及附件引用；R2 保存完整会话 JSON 和所有可取得的附件原件，正文大小不受 D1 单行存储限制。
+
+原件 MIME 根据字节签名和文件名识别，记录在上传 metadata 中，并作为文件响应的 `Content-Type` 返回。会话附件保留 `isImage`，JSON 中 `mimeType` 可为空；图片预览使用原件响应 Blob，无需逐会话加载回填 MIME。缺失原件保留附件 ID、文件名、大小和类别，不伪造可用原件。
+
+同一账号的设备通过 Durable Object `HistorySync` 的 WebSocket 接收变更通知，并自动读取最新目录与已打开会话。进入页面、操作完成、重新连接和页面恢复可见时自动同步，不使用固定轮询或手动刷新操作。通知仅携带状态，完整内容通过已鉴权接口读取。
+
+`importArchive(file, sink?)` 的可选 `ArchiveImportSink` 提供 `addSession`、`saveFiles` 和 `updateFileTypes`；默认使用 db staging，以兼容既有调用。正式云端入口传入 sink，账号检查和导入提交由调用方负责。`updateFileTypes` 仅在整包校验成功后调用一次，云端入口无需重写已上传会话 JSON。
+
+## 云端部署
+
+`migrations/0004_cloud_history.sql` 添加云端目录代次、会话版本、R2 正文引用、附件引用及导入和 multipart upload 状态表，并保留现有用户与会话。现有 D1 会话正文仍可读取，后续写入使用 R2。部署前应用该迁移：本地运行 `pnpm db:migrate:local`，生产部署使用 `pnpm deploy` 或 `pnpm deploy:worker`，两者均在 Worker 发布前执行 `pnpm db:migrate:remote`。
+
+`wrangler.jsonc` 需要 D1 `DB`、私有 R2 `FILES` 和 Durable Object `SYNC` 绑定。`SYNC` 指向 Worker 导出的 `HistorySync` 类，Durable Object 迁移使用 `history-sync-v1` 和 `new_sqlite_classes: ["HistorySync"]`。Wrangler 发布 Worker 时同时应用该 DO 迁移；D1 迁移和 DO 绑定均需完成，多设备通知依赖这份部署配置。
 
 ## 展示与上下文
 
@@ -40,22 +54,22 @@ chat_sessions/{session_id}_files/{file_id}_{file_name}  全部图片原件
 
 ## 导出范围
 
-导出完整消息树与当前分支，只附带本地存在的图片原件；非图片附件仅有元数据。所有消息都从当前正式消息转换为归档片段，包含搜索状态、页内查找词、模板正文、思考用时，以及成功阅读链接结果的签名、URL 和标题。导入后修改的内容、状态和附件以当前值为准，不回写原始归档。具体映射见 [toArchive.ts](./toArchive.ts)。
+导出完整消息树、当前分支和置顶属性，附带可取得的图片、文档及其他附件原件。共享文件 ID 只读取一次，每个引用它的会话目录使用同一原件快照；同一会话内的重复引用使用同一路径。缺失原件只保留元数据，`export_path` 为 `null`。所有消息都从当前正式消息转换为归档片段，包含搜索状态、页内查找词、模板正文、思考用时，以及成功阅读链接结果的签名、URL 和标题。具体映射见 [toArchive.ts](./toArchive.ts)。
 
 本地错误和拒绝提示以导出时的界面语言写入 `TEMPLATE_RESPONSE`，导入后保留文案且不参与上下文；正常空回复和达到长度上限的回复不补造提示。已有模板原样保留，重复导出不会重复追加这些提示。
 
-导出开始时保留列表和已加载会话的内存快照，未打开的会话再逐条从服务端读取，不写入界面详情缓存。读取期间会话被删除而无法取得内容时，整次导出失败；导出标题采用开始时的列表快照。
+导出开始时保留列表和已加载会话的内存快照，未打开的会话再逐条从服务端读取，不写入界面详情缓存。`exportArchive(sessions, loadOriginal?)` 支持原件读取回调，默认使用 `db.loadFile`；正式入口通过回调在读取前后检查账号身份。读取失败或账号变更导致整次导出失败，缺失原件与读取失败分别处理；导出标题采用开始时的列表快照。
 
-归档不保存 API Key 或应用设置，也不能完整恢复本地运行状态：正文引用角标、非图片附件原件、模型、思考签名、原工具调用 ID、结构化错误信息（类型、状态码及重试操作等）、用量明细、非当前分支的选择，以及 `latestReminder` 快照不会保留。新提问的快照按当前设置生成。
+归档不保存 API Key 或应用设置，也不能完整恢复本地运行状态：正文引用角标、模型、思考签名、原工具调用 ID、结构化错误信息（类型、状态码及重试操作等）、用量明细、非当前分支的选择，以及 `latestReminder` 快照不会保留。新提问的快照按当前设置生成。
 
 ## 模块与 ZIP 支持
 
-| 文件                                                                           | 职责                           |
-| ------------------------------------------------------------------------------ | ------------------------------ |
-| [format.ts](./format.ts)、[schema.ts](./schema.ts)                             | 归档类型与字段校验             |
-| [toLocal.ts](./toLocal.ts)、[toArchive.ts](./toArchive.ts)                     | 归档与本地消息转换             |
-| [importArchive.ts](./importArchive.ts)、[exportArchive.ts](./exportArchive.ts) | 条目读取、暂存与归档组装       |
-| [zipReader.ts](./zipReader.ts)、[zipWriter.ts](./zipWriter.ts)                 | ZIP 读写及路径、大小、CRC 校验 |
-| [../backup.ts](../backup.ts)                                                   | 导入导出入口与串行队列         |
+| 文件                                                                           | 职责                              |
+| ------------------------------------------------------------------------------ | --------------------------------- |
+| [format.ts](./format.ts)、[schema.ts](./schema.ts)                             | 归档类型与字段校验                |
+| [toLocal.ts](./toLocal.ts)、[toArchive.ts](./toArchive.ts)                     | 归档与本地消息转换                |
+| [importArchive.ts](./importArchive.ts)、[exportArchive.ts](./exportArchive.ts) | 流式 sink、共享原件校验与归档组装 |
+| [zipReader.ts](./zipReader.ts)、[zipWriter.ts](./zipWriter.ts)                 | ZIP 读写及路径、大小、CRC 校验    |
+| [../backup.ts](../backup.ts)                                                   | 导入导出入口与串行队列            |
 
-支持单卷 ZIP32 的 STORE / DEFLATE，导出使用 STORE。ZIP64、加密、分卷及非 UTF-8 的非 ASCII 文件名不支持；条目名统一按 NFC 比较。不另设业务大小上限，但受 ZIP32 容量和浏览器资源限制，导出会生成完整下载 Blob。
+支持单卷 ZIP32 和 ZIP64 的 STORE / DEFLATE，导出使用 STORE。读取支持 ZIP64 目录、64 位大小与偏移和 64 位 data descriptor；写入在条目数量、大小或偏移达到 ZIP32 边界时自动使用 ZIP64。加密、分卷及非 UTF-8 的非 ASCII 文件名不支持；条目名统一按 NFC 比较，并校验路径、大小和 CRC。不另设业务大小上限，文件大小仍须处于 JavaScript 安全整数范围，导出会生成完整下载 Blob，实际受浏览器资源约束。

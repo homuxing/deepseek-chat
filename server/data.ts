@@ -1,4 +1,4 @@
-import { Hono } from 'hono'
+import { Hono, type Context } from 'hono'
 import { HTTPException } from 'hono/http-exception'
 import {
   assertApiKeyEncryptionConfigured,
@@ -10,17 +10,26 @@ import {
 } from './security.js'
 import { rateLimit } from './auth.js'
 import { verifyCustomApiKey } from './proxy.js'
+import {
+  clearCloudChats,
+  cloudStorageRoutes,
+  deleteActiveChat,
+  deleteUnreferencedFilesBestEffort,
+  ensureActiveHistory,
+  listActiveChats,
+  loadActiveChat,
+  notifyHistoryChange,
+  publishChatUpload,
+  renameActiveChat,
+  resolveExpectedHistory,
+  saveChatSession,
+} from './cloudStorage.js'
 import type { AppEnv } from './types.js'
 
-const MAX_SESSION_BYTES = 900 * 1024
-const MAX_IMPORT_BYTES = 1024 * 1024
-const MAX_IMPORT_SESSIONS = 200
 const MAX_ID_LENGTH = 128
-const MAX_TITLE_LENGTH = 500
 const MAX_MIME_TYPE_LENGTH = 255
 const R2_DELETE_BATCH_SIZE = 500
 const SAFE_IDENTIFIER = /^[A-Za-z0-9][A-Za-z0-9._-]*$/
-const encoder = new TextEncoder()
 
 // Recheck inside the write statement, since administrator cleanup may revoke a session during an upload.
 const liveSessionSql = `EXISTS (
@@ -40,19 +49,6 @@ type Session = {
   rootMessageId?: string | null
 }
 
-type SessionSummary = Pick<Session, 'id' | 'title' | 'createdAt' | 'updatedAt'>
-
-type ChatSummaryRow = {
-  id: string
-  title: string
-  createdAt: number
-  updatedAt: number
-}
-
-type ChatRow = {
-  data_json: string
-}
-
 type FileRow = {
   r2_key: string
   mime_type: string
@@ -61,15 +57,6 @@ type FileRow = {
 
 type FileKeyRow = {
   r2_key: string
-}
-
-type FileIdRow = {
-  id: string
-}
-
-type ScopedR2File = {
-  id: string
-  key: string
 }
 
 type AdminUserRow = {
@@ -135,13 +122,6 @@ const readJson = async (request: Request): Promise<unknown> => {
   return JSON.parse(text) as unknown
 }
 
-const summarize = (session: Session): SessionSummary => ({
-  id: session.id,
-  title: session.title,
-  createdAt: session.createdAt,
-  updatedAt: session.updatedAt,
-})
-
 const isMessage = (value: unknown): boolean => {
   if (!isRecord(value) || !isValidId(value.id) || !isTimestamp(value.createdAt)) {
     return false
@@ -185,7 +165,6 @@ const validateSession = (value: unknown): ValidatedSession | null => {
   if (
     !isValidId(value.id) ||
     typeof value.title !== 'string' ||
-    value.title.length > MAX_TITLE_LENGTH ||
     !isTimestamp(value.createdAt) ||
     !isTimestamp(value.updatedAt) ||
     value.updatedAt < value.createdAt ||
@@ -199,6 +178,9 @@ const validateSession = (value: unknown): ValidatedSession | null => {
     value.rootMessageId !== null &&
     !isValidId(value.rootMessageId)
   ) {
+    return null
+  }
+  if (value.pinned !== undefined && typeof value.pinned !== 'boolean') {
     return null
   }
   return value as ValidatedSession
@@ -224,17 +206,6 @@ const adminUserView = (row: AdminUserRow) => ({
   hasCustomApiKey: row.api_key_ciphertext !== null,
 })
 
-const scopedR2Keys = (keys: string[], userId: string): string[] => {
-  const prefix = `${userId}/`
-  return keys.filter((key) => {
-    if (!key.startsWith(prefix)) {
-      return false
-    }
-    const fileId = key.slice(prefix.length)
-    return isValidId(fileId) && fileId !== '.' && fileId !== '..'
-  })
-}
-
 const deleteR2Keys = async (env: AppEnv['Bindings'], keys: string[]): Promise<void> => {
   for (let offset = 0; offset < keys.length; offset += R2_DELETE_BATCH_SIZE) {
     const batch = keys.slice(offset, offset + R2_DELETE_BATCH_SIZE)
@@ -244,131 +215,37 @@ const deleteR2Keys = async (env: AppEnv['Bindings'], keys: string[]): Promise<vo
   }
 }
 
-const listUserR2Files = async (
-  env: AppEnv['Bindings'],
-  userId: string
-): Promise<ScopedR2File[]> => {
-  if (!isValidId(userId)) {
-    throw new Error('Invalid user id')
-  }
+const isScopedR2Key = (key: string, userId: string): boolean => {
   const prefix = `${userId}/`
-  const files: ScopedR2File[] = []
-  let cursor: string | undefined
-  do {
-    const page = await env.FILES.list({ prefix, cursor, limit: 1000 })
-    for (const object of page.objects) {
-      const id = object.key.slice(prefix.length)
-      if (object.key.startsWith(prefix) && isValidId(id)) {
-        files.push({ id, key: object.key })
-      }
-    }
-    if (page.truncated && !page.cursor) {
-      throw new Error('R2 returned a truncated page without a cursor')
-    }
-    cursor = page.truncated ? page.cursor : undefined
-  } while (cursor)
-  return files
-}
-
-const deleteUnreferencedFiles = async (env: AppEnv['Bindings'], userId: string): Promise<void> => {
-  const [referenced, metadata, objects] = await Promise.all([
-    env.DB.prepare(
-      `SELECT DISTINCT json_extract(referenced.value, '$.id') AS id
-       FROM chats chat
-       JOIN json_each(chat.data_json, '$.messages') message
-       JOIN json_each(message.value, '$.files') referenced
-       WHERE chat.user_id = ?
-         AND json_type(referenced.value, '$.id') = 'text'`
-    )
-      .bind(userId)
-      .all<FileIdRow>(),
-    env.DB.prepare('SELECT id FROM files WHERE user_id = ?').bind(userId).all<FileIdRow>(),
-    listUserR2Files(env, userId),
-  ])
-  const referencedIds = new Set(referenced.results.map((row) => row.id))
-  const orphanObjects = objects.filter((object) => !referencedIds.has(object.id))
-  const orphanMetadata = metadata.results.filter((row) => !referencedIds.has(row.id))
-
-  await deleteR2Keys(
-    env,
-    orphanObjects.map((object) => object.key)
-  )
-  if (orphanMetadata.length > 0) {
-    await env.DB.batch(
-      orphanMetadata.map((row) =>
-        env.DB.prepare('DELETE FROM files WHERE user_id = ? AND id = ?').bind(userId, row.id)
-      )
-    )
+  if (!key.startsWith(prefix) || key.length === prefix.length) {
+    return false
   }
-}
-
-const deleteUnreferencedFilesBestEffort = async (
-  env: AppEnv['Bindings'],
-  userId: string
-): Promise<void> => {
-  try {
-    await deleteUnreferencedFiles(env, userId)
-  } catch {
-    // A later successful import or full clear will retry the orphan cleanup.
-  }
-}
-
-const deleteUserFileObjects = async (env: AppEnv['Bindings'], userId: string): Promise<void> => {
-  const objects = await listUserR2Files(env, userId)
-  await deleteR2Keys(
-    env,
-    objects.map((object) => object.key)
-  )
+  return key
+    .slice(prefix.length)
+    .split('/')
+    .every((part) => part !== '' && part !== '.' && part !== '..')
 }
 
 export const cleanupUserFiles = async (env: AppEnv['Bindings'], userId: string): Promise<void> => {
-  await deleteUserFileObjects(env, userId)
-  await env.DB.batch([
-    env.DB.prepare('DELETE FROM files WHERE user_id = ?').bind(userId),
-    env.DB.prepare('DELETE FROM api_files WHERE user_id = ?').bind(userId),
-  ])
+  await clearCloudChats(env, userId, true)
 }
 
 const clearUserChats = async (
   env: AppEnv['Bindings'],
   userId: string,
-  revokeSessions = false
+  revokeSessions = false,
+  sessionTokenHash?: string
 ): Promise<void> => {
-  await deleteUserFileObjects(env, userId)
-  const statements = [
-    env.DB.prepare('DELETE FROM files WHERE user_id = ?').bind(userId),
-    env.DB.prepare('DELETE FROM api_files WHERE user_id = ?').bind(userId),
-    env.DB.prepare('DELETE FROM chats WHERE user_id = ?').bind(userId),
-  ]
-  if (revokeSessions) {
-    statements.push(
-      env.DB.prepare('UPDATE users SET auth_version = auth_version + 1 WHERE id = ?').bind(userId)
-    )
-    statements.push(env.DB.prepare('DELETE FROM auth_sessions WHERE user_id = ?').bind(userId))
-  }
-  await env.DB.batch(statements)
+  await clearCloudChats(env, userId, revokeSessions, sessionTokenHash)
+  await notifyHistoryChange(env, userId)
 }
 
 export const dataRoutes = new Hono<AppEnv>()
+dataRoutes.route('/', cloudStorageRoutes)
 
 dataRoutes.get('/chats', async (c) => {
   const user = c.get('user')
-  const rows = await c.env.DB.prepare(
-    `SELECT id, title, created_at AS createdAt, updated_at AS updatedAt
-     FROM chats
-     WHERE user_id = ?
-     ORDER BY updated_at DESC, created_at DESC, id ASC`
-  )
-    .bind(user.id)
-    .all<ChatSummaryRow>()
-
-  const sessions: SessionSummary[] = rows.results.map((row) => ({
-    id: row.id,
-    title: row.title,
-    createdAt: row.createdAt,
-    updatedAt: row.updatedAt,
-  }))
-  return jsonResponse({ sessions })
+  return jsonResponse(await listActiveChats(c.env, user.id))
 })
 
 dataRoutes.get('/chats/:id', async (c) => {
@@ -377,27 +254,22 @@ dataRoutes.get('/chats/:id', async (c) => {
   if (!isValidId(id)) {
     return errorResponse('Invalid chat id')
   }
-  const row = await c.env.DB.prepare('SELECT data_json FROM chats WHERE user_id = ? AND id = ?')
-    .bind(user.id, id)
-    .first<ChatRow>()
-  if (!row) {
-    return errorResponse('Chat not found', 404)
+  const loaded = await loadActiveChat(c.env, user.id, id)
+  if (loaded.kind === 'not_found') {
+    return errorResponse('会话不存在', 404)
   }
-
-  try {
-    const value = JSON.parse(row.data_json) as unknown
-    if (!isRecord(value) || value.id !== id) {
-      return errorResponse('Stored chat is invalid', 500)
-    }
-    return jsonResponse({ session: value })
-  } catch {
-    return errorResponse('Stored chat is invalid', 500)
+  if (loaded.kind === 'invalid') {
+    return errorResponse(loaded.message, 500)
   }
+  return jsonResponse({ session: loaded.session, summary: loaded.summary })
 })
 
-dataRoutes.put('/chats/:id', async (c) => {
+const saveChatRoute = async (c: Context<AppEnv>): Promise<Response> => {
   const user = c.get('user')
   const id = c.req.param('id')
+  if (id === 'import') {
+    return legacyImportRoute(c)
+  }
   if (!isValidId(id)) {
     return errorResponse('Invalid chat id')
   }
@@ -408,45 +280,65 @@ dataRoutes.put('/chats/:id', async (c) => {
   } catch {
     return errorResponse('Invalid JSON body')
   }
-  if (!isRecord(body) || !('session' in body)) {
-    return errorResponse('session is required')
+  if (!isRecord(body)) {
+    return errorResponse('请求内容无效')
+  }
+
+  if ('uploadId' in body) {
+    if (!isValidId(body.uploadId)) {
+      return errorResponse('上传任务 ID 无效')
+    }
+    return publishChatUpload(c.env, user, body.uploadId)
+  }
+
+  if (!('session' in body)) {
+    return errorResponse('session 或 uploadId 必须提供')
   }
   const session = validateSession(body.session)
   if (!session || session.id !== id) {
     return errorResponse('Invalid session')
   }
 
-  const dataJson = JSON.stringify(session)
-  if (encoder.encode(dataJson).byteLength > MAX_SESSION_BYTES) {
-    return errorResponse('Session is too large', 413)
-  }
-
-  const written = await c.env.DB.prepare(
-    `INSERT INTO chats (user_id, id, title, created_at, updated_at, data_json)
-     SELECT ?, ?, ?, ?, ?, ? WHERE ${liveSessionSql}
-     ON CONFLICT(user_id, id) DO UPDATE SET
-       title = excluded.title,
-       created_at = excluded.created_at,
-       updated_at = excluded.updated_at,
-       data_json = excluded.data_json`
+  const active = await ensureActiveHistory(c.env, user.id)
+  const existing = await c.env.DB.prepare(
+    `SELECT revision FROM chats
+     WHERE user_id = ? AND generation = ? AND id = ?`
   )
-    .bind(
-      user.id,
-      session.id,
-      session.title,
-      session.createdAt,
-      session.updatedAt,
-      dataJson,
-      c.get('sessionTokenHash'),
-      user.id,
-      Date.now()
-    )
-    .run()
-  if (written.meta.changes === 0) {
-    throw new HTTPException(401, { message: '登录状态已变更，请重新登录' })
+    .bind(user.id, active.generation, id)
+    .first<{ revision: number }>()
+  const expected = resolveExpectedHistory(
+    body,
+    new Headers(c.req.raw.headers),
+    active,
+    existing?.revision ?? 0
+  )
+  if (!expected) {
+    return errorResponse('generation 或 expectedRevision 无效')
   }
-  return noContent()
-})
+  const saved = await saveChatSession(c.env, user, c.get('sessionTokenHash'), session, expected)
+  if (saved.kind === 'unauthorized') {
+    throw new HTTPException(401, { message: saved.message })
+  }
+  if (saved.kind === 'conflict') {
+    return errorResponse(saved.message, 409)
+  }
+  await notifyHistoryChange(c.env, user.id)
+  const hasExpectedVersion =
+    body.generation !== undefined ||
+    body.expectedRevision !== undefined ||
+    c.req.header('X-Chat-Generation') !== undefined ||
+    c.req.header('X-Chat-Revision') !== undefined
+  return hasExpectedVersion
+    ? jsonResponse({
+        summary: saved.summary,
+        generation: saved.summary.generation,
+        revision: saved.summary.revision,
+      })
+    : noContent()
+}
+
+dataRoutes.put('/chats/:id', saveChatRoute)
+dataRoutes.post('/chats/:id', saveChatRoute)
 
 dataRoutes.patch('/chats/:id', async (c) => {
   const user = c.get('user')
@@ -461,39 +353,48 @@ dataRoutes.patch('/chats/:id', async (c) => {
   } catch {
     return errorResponse('Invalid JSON body')
   }
-  if (!isRecord(body) || typeof body.title !== 'string' || body.title.length > MAX_TITLE_LENGTH) {
+  if (!isRecord(body) || typeof body.title !== 'string') {
     return errorResponse('Invalid title')
   }
-
-  const row = await c.env.DB.prepare('SELECT data_json FROM chats WHERE user_id = ? AND id = ?')
-    .bind(user.id, id)
-    .first<ChatRow>()
-  if (!row) {
-    return errorResponse('Chat not found', 404)
-  }
-
-  let session: JsonRecord
-  try {
-    const value = JSON.parse(row.data_json) as unknown
-    if (!isRecord(value) || value.id !== id) {
-      throw new Error('Invalid stored session')
-    }
-    session = { ...value, title: body.title }
-  } catch {
-    return errorResponse('Stored chat is invalid', 500)
-  }
-
-  const dataJson = JSON.stringify(session)
-  if (encoder.encode(dataJson).byteLength > MAX_SESSION_BYTES) {
-    return errorResponse('Session is too large', 413)
-  }
-  const result = await c.env.DB.prepare(
-    'UPDATE chats SET title = ?, data_json = ? WHERE user_id = ? AND id = ?'
+  const active = await ensureActiveHistory(c.env, user.id)
+  const existing = await c.env.DB.prepare(
+    `SELECT revision FROM chats
+     WHERE user_id = ? AND generation = ? AND id = ?`
   )
-    .bind(body.title, dataJson, user.id, id)
-    .run()
-  if (result.meta.changes === 0) {
-    return errorResponse('Chat not found', 404)
+    .bind(user.id, active.generation, id)
+    .first<{ revision: number }>()
+  const expected = resolveExpectedHistory(
+    body,
+    new Headers(c.req.raw.headers),
+    active,
+    existing?.revision ?? 0
+  )
+  if (!expected) {
+    return errorResponse('generation 或 expectedRevision 无效')
+  }
+  const renamed = await renameActiveChat(
+    c.env,
+    user,
+    c.get('sessionTokenHash'),
+    id,
+    body.title,
+    expected
+  )
+  if (renamed.kind === 'unauthorized') {
+    throw new HTTPException(401, { message: renamed.message })
+  }
+  if (renamed.kind === 'conflict') {
+    return errorResponse(renamed.message, 409)
+  }
+  if (renamed.kind === 'not_found') {
+    return errorResponse('会话不存在', 404)
+  }
+  await notifyHistoryChange(c.env, user.id)
+  const hasVersion =
+    c.req.header('X-Chat-Revision') !== undefined || body.expectedRevision !== undefined
+  if (hasVersion) {
+    const history = await ensureActiveHistory(c.env, user.id)
+    return jsonResponse({ summary: renamed.summary, ...history })
   }
   return noContent()
 })
@@ -504,80 +405,52 @@ dataRoutes.delete('/chats/:id', async (c) => {
   if (!isValidId(id)) {
     return errorResponse('Invalid chat id')
   }
-
-  const [deleted, remaining, objects] = await Promise.all([
-    c.env.DB.prepare(
-      `SELECT DISTINCT json_extract(deleted_file.value, '$.id') AS id
-       FROM chats chat
-       JOIN json_each(chat.data_json, '$.messages') message
-       JOIN json_each(message.value, '$.files') deleted_file
-       WHERE chat.user_id = ?
-         AND chat.id = ?
-         AND json_type(deleted_file.value, '$.id') = 'text'`
-    )
-      .bind(user.id, id)
-      .all<FileIdRow>(),
-    c.env.DB.prepare(
-      `SELECT DISTINCT json_extract(referenced.value, '$.id') AS id
-       FROM chats remaining
-       JOIN json_each(remaining.data_json, '$.messages') message
-       JOIN json_each(message.value, '$.files') referenced
-       WHERE remaining.user_id = ?
-         AND remaining.id <> ?
-         AND json_type(referenced.value, '$.id') = 'text'`
-    )
-      .bind(user.id, id)
-      .all<FileIdRow>(),
-    listUserR2Files(c.env, user.id),
-  ])
-  const remainingIds = new Set(remaining.results.map((row) => row.id))
-  const orphanIds = deleted.results
-    .map((row) => row.id)
-    .filter((fileId) => !remainingIds.has(fileId))
-  const orphanSet = new Set(orphanIds)
-
-  await deleteR2Keys(
-    c.env,
-    objects.filter((object) => orphanSet.has(object.id)).map((object) => object.key)
+  const active = await ensureActiveHistory(c.env, user.id)
+  const existing = await c.env.DB.prepare(
+    `SELECT revision FROM chats
+     WHERE user_id = ? AND generation = ? AND id = ?`
   )
-  await c.env.DB.batch([
-    ...orphanIds.map((fileId) =>
-      c.env.DB.prepare('DELETE FROM files WHERE user_id = ? AND id = ?').bind(user.id, fileId)
-    ),
-    c.env.DB.prepare('DELETE FROM chats WHERE user_id = ? AND id = ?').bind(user.id, id),
-  ])
+    .bind(user.id, active.generation, id)
+    .first<{ revision: number }>()
+  const expected = resolveExpectedHistory(
+    {},
+    new Headers(c.req.raw.headers),
+    active,
+    existing?.revision ?? 0
+  )
+  if (!expected) {
+    return errorResponse('X-Chat-Generation 或 X-Chat-Revision 无效')
+  }
+  const deleted = await deleteActiveChat(c.env, user, c.get('sessionTokenHash'), id, expected)
+  if (deleted.kind === 'unauthorized') {
+    throw new HTTPException(401, { message: deleted.message })
+  }
+  if (deleted.kind === 'conflict') {
+    return errorResponse(deleted.message, 409)
+  }
+  if (deleted.kind === 'not_found') {
+    return errorResponse('会话不存在', 404)
+  }
+  await notifyHistoryChange(c.env, user.id)
   return noContent()
 })
 
 dataRoutes.delete('/chats', async (c) => {
   const user = c.get('user')
-  await clearUserChats(c.env, user.id)
+  await clearUserChats(c.env, user.id, false, c.get('sessionTokenHash'))
   return noContent()
 })
 
-dataRoutes.post('/chats/import', async (c) => {
+async function legacyImportRoute(c: Context<AppEnv>): Promise<Response> {
   const user = c.get('user')
-  const contentLength = Number(c.req.header('content-length'))
-  if (Number.isFinite(contentLength) && contentLength > MAX_IMPORT_BYTES) {
-    return errorResponse('Import is too large', 413)
-  }
-
-  const bodyBytes = await c.req.arrayBuffer()
-  if (bodyBytes.byteLength > MAX_IMPORT_BYTES) {
-    return errorResponse('Import is too large', 413)
-  }
-
   let body: unknown
   try {
-    body = JSON.parse(new TextDecoder().decode(bodyBytes)) as unknown
+    body = await readJson(c.req.raw)
   } catch {
     return errorResponse('Invalid JSON body')
   }
   if (!isRecord(body) || !Array.isArray(body.sessions)) {
     return errorResponse('sessions must be an array')
-  }
-  if (body.sessions.length > MAX_IMPORT_SESSIONS) {
-    return errorResponse(`At most ${MAX_IMPORT_SESSIONS} sessions can be imported`)
   }
 
   const sessions: ValidatedSession[] = []
@@ -587,10 +460,6 @@ dataRoutes.post('/chats/import', async (c) => {
     if (!session) {
       return errorResponse('Invalid session')
     }
-    const serialized = JSON.stringify(session)
-    if (encoder.encode(serialized).byteLength > MAX_SESSION_BYTES) {
-      return errorResponse('Session is too large', 413)
-    }
     if (ids.has(session.id)) {
       return errorResponse('Duplicate session id')
     }
@@ -598,37 +467,131 @@ dataRoutes.post('/chats/import', async (c) => {
     sessions.push(session)
   }
 
-  const statements = [
-    c.env.DB.prepare(`DELETE FROM chats WHERE user_id = ? AND ${liveSessionSql}`).bind(
-      user.id,
-      c.get('sessionTokenHash'),
-      user.id,
-      Date.now()
-    ),
-    ...sessions.map((session) =>
+  const active = await ensureActiveHistory(c.env, user.id)
+  const importId = crypto.randomUUID()
+  const generation = `legacy_import_${crypto.randomUUID().replaceAll('-', '')}`
+  const metadata = sessions.map((session) => ({
+    id: session.id,
+    title: session.title,
+    createdAt: session.createdAt,
+    updatedAt: session.updatedAt,
+    pinned: session.pinned === true ? 1 : 0,
+    bodyKey: `${user.id}/chats/${generation}/${session.id}/${crypto.randomUUID()}`,
+  }))
+  const referenceRows = sessions.map((session) => {
+    const fileIds = new Set<string>()
+    for (const message of session.messages as unknown[]) {
+      if (!isRecord(message) || !Array.isArray(message.files)) {
+        continue
+      }
+      for (const file of message.files) {
+        if (isRecord(file) && isValidId(file.id)) {
+          fileIds.add(file.id)
+        }
+      }
+    }
+    return { chatId: session.id, fileIds: [...fileIds] }
+  })
+  const keys = metadata.map((item) => item.bodyKey)
+  try {
+    await Promise.all(
+      sessions.map((session, index) =>
+        c.env.FILES.put(keys[index], JSON.stringify(session), {
+          httpMetadata: { contentType: 'application/json; charset=utf-8' },
+        })
+      )
+    )
+    const results = await c.env.DB.batch([
       c.env.DB.prepare(
-        `INSERT INTO chats (user_id, id, title, created_at, updated_at, data_json)
-         SELECT ?, ?, ?, ?, ?, ? WHERE ${liveSessionSql}`
+        `INSERT INTO cloud_imports
+           (user_id, id, generation, base_revision, status, count, created_at, updated_at)
+         VALUES (?, ?, ?, ?, 'staging', ?, ?, ?)`
       ).bind(
         user.id,
-        session.id,
-        session.title,
-        session.createdAt,
-        session.updatedAt,
-        JSON.stringify(session),
+        importId,
+        generation,
+        active.revision,
+        sessions.length,
+        Date.now(),
+        Date.now()
+      ),
+      c.env.DB.prepare(
+        `INSERT INTO chats
+           (user_id, generation, id, revision, title, pinned,
+            created_at, updated_at, data_json, body_key)
+         SELECT ?, ?, json_extract(value, '$.id'), ?, json_extract(value, '$.title'),
+                json_extract(value, '$.pinned'),
+                json_extract(value, '$.createdAt'), json_extract(value, '$.updatedAt'), '{}',
+                json_extract(value, '$.bodyKey')
+         FROM json_each(?)`
+      ).bind(user.id, generation, active.revision, JSON.stringify(metadata)),
+      c.env.DB.prepare(
+        `INSERT OR IGNORE INTO chat_files (user_id, generation, chat_id, file_id)
+         SELECT ?, ?, json_extract(chat.value, '$.chatId'), file.value
+         FROM json_each(?) chat
+         JOIN json_each(chat.value, '$.fileIds') file`
+      ).bind(user.id, generation, JSON.stringify(referenceRows)),
+      c.env.DB.prepare(
+        `UPDATE cloud_history SET generation = ?, revision = revision + 1
+         WHERE user_id = ? AND generation = ? AND revision = ?
+           AND ${liveSessionSql}`
+      ).bind(
+        generation,
+        user.id,
+        active.generation,
+        active.revision,
         c.get('sessionTokenHash'),
         user.id,
         Date.now()
-      )
-    ),
-  ]
-  const committed = await c.env.DB.batch(statements)
-  if (sessions.length > 0 && committed[1].meta.changes !== 1) {
-    throw new HTTPException(401, { message: '登录状态已变更，请重新登录' })
+      ),
+      c.env.DB.prepare(
+        `UPDATE cloud_imports SET status = 'committed', updated_at = ?
+         WHERE user_id = ? AND id = ?
+           AND changes() = 1
+           AND EXISTS (
+             SELECT 1 FROM cloud_history
+             WHERE user_id = ? AND generation = ? AND revision = ?
+           )`
+      ).bind(Date.now(), user.id, importId, user.id, generation, active.revision + 1),
+      c.env.DB.prepare(
+        `UPDATE chats SET revision = ?
+         WHERE user_id = ? AND generation = ?
+           AND changes() = 1
+           AND EXISTS (
+             SELECT 1 FROM cloud_history
+             WHERE user_id = ? AND generation = ? AND revision = ?
+           )`
+      ).bind(active.revision + 1, user.id, generation, user.id, generation, active.revision + 1),
+    ])
+    if (results[3].meta.changes === 0) {
+      const live = await c.env.DB.prepare(`SELECT ${liveSessionSql} AS live`)
+        .bind(c.get('sessionTokenHash'), user.id, Date.now())
+        .first<{ live: number }>()
+      await deleteR2Keys(c.env, keys)
+      if (!live?.live) {
+        throw new HTTPException(401, { message: '登录状态已变更，请重新登录' })
+      }
+      throw new HTTPException(409, { message: '账号历史已在其他设备更新，请重试导入' })
+    }
+    if (results[4].meta.changes === 0) {
+      throw new Error('导入切换后任务状态未提交')
+    }
+  } catch (error) {
+    await deleteR2Keys(c.env, keys)
+    throw error
   }
-  await deleteUnreferencedFilesBestEffort(c.env, user.id)
-  return jsonResponse({ sessions: sessions.map(summarize) })
-})
+  await deleteUnreferencedFilesBestEffort(c.env, user.id, false)
+  await notifyHistoryChange(c.env, user.id)
+  const listed = await listActiveChats(c.env, user.id)
+  return jsonResponse({
+    sessions: listed.sessions,
+    generation: listed.generation,
+    revision: listed.revision,
+    count: listed.sessions.length,
+  })
+}
+
+dataRoutes.post('/chats/import', legacyImportRoute)
 
 dataRoutes.post('/files/:id', async (c) => {
   const user = c.get('user')
@@ -642,7 +605,7 @@ dataRoutes.post('/files/:id', async (c) => {
     return errorResponse('Invalid Content-Type')
   }
 
-  const key = `${user.id}/${id}`
+  const key = `${user.id}/files/${crypto.randomUUID()}`
   const object = await c.env.FILES.put(key, c.req.raw.body ?? new Uint8Array(), {
     httpMetadata: {
       contentType: mimeType,
@@ -673,6 +636,7 @@ dataRoutes.post('/files/:id', async (c) => {
     await c.env.FILES.delete(key)
     throw new HTTPException(401, { message: '登录状态已变更，请重新登录' })
   }
+  await notifyHistoryChange(c.env, user.id)
   return noContent()
 })
 
@@ -687,7 +651,7 @@ dataRoutes.get('/files/:id', async (c) => {
   )
     .bind(user.id, id)
     .first<FileRow>()
-  if (!row || !scopedR2Keys([row.r2_key], user.id).length) {
+  if (!row || !isScopedR2Key(row.r2_key, user.id)) {
     return errorResponse('File not found', 404)
   }
 
@@ -716,12 +680,12 @@ dataRoutes.delete('/files/:id', async (c) => {
     .bind(user.id, id)
     .first<FileKeyRow>()
   if (row) {
-    const [key] = scopedR2Keys([row.r2_key], user.id)
-    if (key) {
-      await c.env.FILES.delete(key)
+    if (isScopedR2Key(row.r2_key, user.id)) {
+      await c.env.FILES.delete(row.r2_key)
     }
   }
   await c.env.DB.prepare('DELETE FROM files WHERE user_id = ? AND id = ?').bind(user.id, id).run()
+  await notifyHistoryChange(c.env, user.id)
   return noContent()
 })
 
@@ -771,6 +735,7 @@ dataRoutes.put('/settings/api-key', async (c) => {
   if (result.meta.changes === 0) {
     throw new HTTPException(401, { message: '登录已失效，请重新登录' })
   }
+  await notifyHistoryChange(c.env, user.id)
   return jsonResponse({ hasCustomApiKey: ciphertext !== null })
 })
 
@@ -784,6 +749,7 @@ dataRoutes.delete('/settings/api-key', async (c) => {
   if (result.meta.changes === 0) {
     throw new HTTPException(401, { message: '登录已失效，请重新登录' })
   }
+  await notifyHistoryChange(c.env, user.id)
   return noContent()
 })
 

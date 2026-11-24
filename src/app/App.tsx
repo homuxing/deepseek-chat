@@ -5,10 +5,13 @@ import { useIsMobile, useMobileViewport, usePreventPageScroll } from './viewport
 import {
   bindChatPersistence,
   initChat,
+  resolveSessionConflict,
   retrySaveSessions,
   selectSession,
   useChatStore,
+  synchronizeHistory,
 } from '../services/chat/store.js'
+import { bindHistorySync } from '../services/chat/sync.js'
 import { SearchPanel } from '../components/search/SearchPanel.js'
 import { closeSearchPanel } from '../components/search/searchPanelState.js'
 import { SessionView } from '../components/session/SessionView.js'
@@ -34,7 +37,11 @@ export const App = () => {
   const ready = useChatStore((state) => state.ready)
   const initError = useChatStore((state) => state.initError)
   const saveError = useChatStore((state) => Object.values(state.sessionSaveErrors).some(Boolean))
+  const conflict = useChatStore((state) => Object.values(state.sessionConflictErrors).some(Boolean))
+  const syncError = useChatStore((state) => state.syncError)
+  const syncErrorKind = useChatStore((state) => state.syncErrorKind)
   const importingHistory = useChatStore((state) => state.importingHistory)
+  const resolvingConflictId = useChatStore((state) => state.resolvingConflictId)
   const session = useChatStore((state) =>
     state.activeId !== null && Object.hasOwn(state.sessionCache, state.activeId)
       ? state.sessionCache[state.activeId]
@@ -48,6 +55,17 @@ export const App = () => {
     state.activeId === null ? false : Object.hasOwn(state.streaming, state.activeId)
   )
   const activeId = useChatStore((state) => state.activeId)
+  const activeConflict = useChatStore(
+    (state) =>
+      state.activeId !== null && state.sessionConflictErrors[state.activeId] === true
+  )
+  const firstConflictId = useChatStore(
+    (state) =>
+      Object.keys(state.sessionConflictErrors).find(
+        (id) => state.sessionConflictErrors[id]
+      ) ?? null
+  )
+  const conflictId = activeConflict ? activeId : firstConflictId
 
   usePreventPageScroll(isMobile)
 
@@ -58,6 +76,7 @@ export const App = () => {
   // 文件数、存储空间达到上限时，附件上只显示「上传失败」，原因用 toast 说明
   useEffect(() => onUploadNotice(showToast), [])
   useEffect(bindChatPersistence, [])
+  useEffect(() => bindHistorySync(synchronizeHistory), [])
 
   // 搜索结果面板只属于当前会话
   useEffect(closeSearchPanel, [activeId])
@@ -75,17 +94,43 @@ export const App = () => {
       <div ref={frameRef} className={styles.frame}>
         {isMobile ? <MobileSider /> : <DesktopSider collapsed={siderCollapsed} />}
         <main className={styles.main}>
+          {syncError ? (
+            <div className={styles.saveError} role="alert">
+              {t(syncErrorKind === 'action' ? 'syncActionFailed' : 'sessionSyncFailed', {
+                message: syncError,
+              })}
+            </div>
+          ) : null}
           {saveError ? (
             <div className={styles.saveError} role="alert">
-              <span>{t('sessionSaveFailed')}</span>
-              <Button
-                variant="outlined"
-                size="s"
-                disabled={importingHistory}
-                onClick={retrySaveSessions}
-              >
-                {t('retry')}
-              </Button>
+              <span>{t(conflict ? 'syncConflict' : 'sessionSaveFailed')}</span>
+              {conflict && conflictId ? (
+                <Button
+                  variant="outlined"
+                  size="s"
+                  disabled={importingHistory || resolvingConflictId !== null}
+                  onClick={async () => {
+                    const resolved = await resolveSessionConflict(conflictId)
+                    if (resolved) {
+                      selectSession(conflictId)
+                      showToast({ key: 'conflictCopySaved' })
+                    }
+                  }}
+                >
+                  {resolvingConflictId === conflictId
+                    ? t('conflictResolving')
+                    : t('resolveConflictKeepCopy')}
+                </Button>
+              ) : (
+                <Button
+                  variant="outlined"
+                  size="s"
+                  disabled={importingHistory}
+                  onClick={retrySaveSessions}
+                >
+                  {t('retry')}
+                </Button>
+              )}
             </div>
           ) : null}
           <div className={styles.content}>

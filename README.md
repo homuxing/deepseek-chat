@@ -8,7 +8,7 @@ Based on DeepSeek's chat demo, with React, Hono, Cloudflare Workers, D1 and R2.
 
 - Invitation registration and password login.
 - Administrator password login, invitation and user management.
-- Per-user chat history and attachments, with ZIP import and export.
+- Cloud chat history and attachments per user, with official DeepSeek ZIP import, export and automatic multi-device sync.
 - Encrypted custom API keys, with `DEEPSEEK_API_KEY` as the fallback.
 - Streaming chat, reasoning, search and speech.
 
@@ -30,7 +30,7 @@ For frontend hot reload, also run `pnpm dev` and open `http://localhost:8090`. A
 
 ## Deployment
 
-`wrangler.jsonc` configures Worker `deepseek-chat`, D1 `chat` (binding `DB`) and R2 `chat` (binding `FILES`).
+`wrangler.jsonc` configures Worker `deepseek-chat`, D1 `chat` (binding `DB`), private R2 `chat` (binding `FILES`) and Durable Object `HistorySync` (binding `SYNC`). D1 stores the chat directory and versions; R2 stores complete conversation JSON and attachment originals.
 
 Deploy with **Cloudflare Workers**. `pnpm build` generates frontend assets in `dist`; Wrangler bundles the backend from `main: server/index.ts` and publishes both together. A Pages project configured with `pnpm build` and output directory `dist` only publishes this project's frontend and cannot run its authentication API.
 
@@ -59,6 +59,10 @@ pnpm deploy
 ```
 
 `pnpm deploy` builds the frontend, applies remote D1 migrations, and publishes the frontend and backend together.
+
+Cloud history requires `migrations/0004_cloud_history.sql`. It preserves existing users and conversations, adds directory generations, conversation versions, R2 body references, attachment references, and import and multipart upload records. Existing D1 conversation bodies remain readable; subsequent writes use R2. Apply local migrations with `pnpm db:migrate:local`; `pnpm deploy` and `pnpm deploy:worker` apply remote migrations before publishing.
+
+Keep the `SYNC` Durable Object binding and the `history-sync-v1` migration with `new_sqlite_classes: ["HistorySync"]` in `wrangler.jsonc`. Wrangler applies this DO migration when deploying the Worker that exports `HistorySync`. Both the D1 migration and this DO deployment are required for cloud history and automatic multi-device notifications.
 
 In Workers & Pages → deepseek-chat → Settings → Variables and Secrets, configure:
 
@@ -92,7 +96,9 @@ GitHub Actions runs these checks on pushes and pull requests, or manually. Produ
 
 ## History
 
-Export history from the original demo and import the ZIP here. Imports accept up to 200 conversations and 1 MiB of JSON, with 900 KiB per conversation. See [history format](src/services/chat/history/README.md).
+Import an official DeepSeek history ZIP with `export_format_version: 3`. Conversations stream directly to cloud storage, preserving the full message tree, current branch, text, reasoning, search results and pinned state. Images, documents and other available originals are stored in R2; shared attachments keep one file identity across conversations. Missing originals retain their metadata. The app sets no business limit on conversation count, individual conversation JSON or total JSON size; practical capacity depends on browser resources and cloud platform limits. ZIP32 and ZIP64 are supported.
+
+D1 stores the per-user directory, versions and attachment references, while R2 stores complete conversation JSON and originals. An import replaces history only after upload and archive validation succeed. Devices signed into the same account receive Durable Object notifications and automatically read updated history, including after reconnecting or returning to the page, without fixed polling or a manual refresh action. See [history format and cloud deployment](src/services/chat/history/README.md).
 
 ## License
 
