@@ -1,26 +1,23 @@
-import { useState } from 'react'
-import {
-  ApiError,
-  clearCustomApiKey,
-  saveCustomApiKey,
-  verifyApiKey,
-} from '../../services/api/client.js'
+import { useRef, useState } from 'react'
+import { ApiError, clearCustomApiKey, saveCustomApiKey } from '../../services/api/client.js'
 import { classifyApiError } from '../../services/api/errors.js'
+import { getBackendUserId } from '../../services/backend.js'
 import { setApiKey } from '../../services/settings.js'
 import { useTranslate } from '../../i18n/index.js'
 
-type FailureAction = 'verify' | 'save' | 'clear'
+type FailureAction = 'save' | 'clear'
 type Failure = { cause: unknown; action: FailureAction }
 
 const errorMessage = (cause: unknown): string =>
   cause instanceof Error ? cause.message : String(cause)
 
-/** Verify a candidate key, save it server-side, and keep only a configured marker in memory. */
+/** 服务端完成校验和保存，前端只保留已配置标记。 */
 export const useApiKeyForm = (onSaved?: () => void) => {
   const t = useTranslate()
   const [value, setValue] = useState('')
   const [busy, setBusy] = useState(false)
   const [failure, setFailure] = useState<Failure | null>(null)
+  const submitting = useRef(false)
 
   const describeFailure = (current: Failure): string => {
     const condition = classifyApiError(current.cause)
@@ -37,48 +34,58 @@ export const useApiKeyForm = (onSaved?: () => void) => {
     if (current.action === 'clear') {
       return t('apiKeyClearFailed', { message })
     }
-    if (current.action === 'save') {
-      return t('apiKeySaveFailed', { message })
-    }
-    return t('apiKeyVerificationFailed', { message })
+    return t('apiKeySaveFailed', { message })
   }
 
   const submit = async () => {
     const apiKey = value.trim()
-    if (!apiKey || busy) {
+    if (!apiKey || submitting.current) {
       return
     }
-    let action: FailureAction = 'verify'
+    submitting.current = true
+    const userId = getBackendUserId()
     setBusy(true)
     setFailure(null)
     try {
-      await verifyApiKey(apiKey)
-      action = 'save'
       await saveCustomApiKey(apiKey)
+      if (getBackendUserId() !== userId) {
+        return
+      }
       setApiKey('configured')
       setValue('')
       onSaved?.()
     } catch (cause) {
-      setFailure({ cause, action })
+      if (getBackendUserId() === userId) {
+        setFailure({ cause, action: 'save' })
+      }
     } finally {
+      submitting.current = false
       setBusy(false)
     }
   }
 
   const clear = async () => {
-    if (busy) {
+    if (submitting.current) {
       return
     }
+    submitting.current = true
+    const userId = getBackendUserId()
     setBusy(true)
     setFailure(null)
     try {
       await clearCustomApiKey()
+      if (getBackendUserId() !== userId) {
+        return
+      }
       setApiKey(null)
       setValue('')
       onSaved?.()
     } catch (cause) {
-      setFailure({ cause, action: 'clear' })
+      if (getBackendUserId() === userId) {
+        setFailure({ cause, action: 'clear' })
+      }
     } finally {
+      submitting.current = false
       setBusy(false)
     }
   }

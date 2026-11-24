@@ -509,6 +509,127 @@ test('custom keys are encrypted and take precedence; shared upstream files enfor
   )
 })
 
+test('自定义 API Key 的校验与加密配置独立，保存失败保留原凭据，恢复配置后可保存和清除', async () => {
+  const secret = env.API_KEY_ENCRYPTION_KEY
+  const candidate = `sk-${'a1'.repeat(16)}`
+  const original = `sk-${'b2'.repeat(16)}`
+  const storedKey = () =>
+    db.db.prepare('SELECT api_key_ciphertext FROM users WHERE id = ?').get(alice.user.id)
+      .api_key_ciphertext
+  const save = (apiKey) =>
+    call('/api/settings/api-key', { method: 'PUT', cookie: alice.cookie, body: { apiKey } })
+  try {
+    assert.equal((await save(original)).status, 200)
+    const ciphertext = storedKey()
+    for (const invalidSecret of [undefined, '', 'x'.repeat(31)]) {
+      env.API_KEY_ENCRYPTION_KEY = invalidSecret
+      const verified = await call('/api/settings/api-key/verify', {
+        method: 'POST',
+        cookie: alice.cookie,
+        body: { apiKey: candidate },
+      })
+      assert.equal(verified.status, 204)
+      assert.equal(upstreamCalls.at(-1).headers.get('Authorization'), `Bearer ${candidate}`)
+      const failed = await save(candidate)
+      assert.equal(failed.status, 503)
+      const error = await failed.json()
+      assert.match(error.error.message, /自定义 API Key 服务配置异常/)
+      assert.ok(!JSON.stringify(error).includes('API_KEY_ENCRYPTION_KEY'))
+      assert.equal(storedKey(), ciphertext)
+      const beforeRead = upstreamCalls.length
+      assert.equal((await call('/api/models', { cookie: alice.cookie })).status, 503)
+      assert.equal(upstreamCalls.length, beforeRead)
+    }
+    env.API_KEY_ENCRYPTION_KEY = 'x'.repeat(32)
+    assert.equal((await save(`  ${candidate}  `)).status, 200)
+    assert.equal(await decryptApiKey(storedKey(), env.API_KEY_ENCRYPTION_KEY), candidate)
+    const settings = await call('/api/settings', { cookie: alice.cookie })
+    assert.deepEqual(await settings.json(), { hasCustomApiKey: true })
+    const identity = await call('/api/auth/me', { cookie: alice.cookie })
+    const identityBody = await identity.json()
+    assert.equal(identityBody.user.hasCustomApiKey, true)
+    assert.ok(!JSON.stringify(identityBody).includes(candidate))
+    for (const [path, options] of [
+      ['/api/models', {}],
+      [
+        '/api/anthropic/v1/messages',
+        {
+          method: 'POST',
+          body: { model: 'deepseek-flash', messages: [{ role: 'user', content: 'Hello' }] },
+        },
+      ],
+      ['/api/v1/tools/asr', { method: 'POST', body: 'audio' }],
+      ['/api/v1/tools/tts', { method: 'POST', body: { text: 'Hello' } }],
+    ]) {
+      const response = await call(path, { ...options, cookie: alice.cookie })
+      assert.equal(response.status, 200)
+      assert.equal(upstreamCalls.at(-1).headers.get('Authorization'), `Bearer ${candidate}`)
+      assert.equal(upstreamCalls.at(-1).headers.get('x-api-key'), candidate)
+    }
+    env.API_KEY_ENCRYPTION_KEY = undefined
+    assert.equal(
+      (await call('/api/settings/api-key', { method: 'DELETE', cookie: alice.cookie })).status,
+      204
+    )
+    assert.equal(storedKey(), null)
+    assert.equal((await call('/api/models', { cookie: alice.cookie })).status, 200)
+    assert.equal(
+      upstreamCalls.at(-1).headers.get('Authorization'),
+      `Bearer ${env.DEEPSEEK_API_KEY}`
+    )
+  } finally {
+    env.API_KEY_ENCRYPTION_KEY = secret
+    await call('/api/settings/api-key', { method: 'DELETE', cookie: alice.cookie })
+  }
+})
+
+test('加密 Secret 变更或密文损坏时如实失败，恢复原 Secret 后继续使用原凭据', async () => {
+  const secret = env.API_KEY_ENCRYPTION_KEY
+  const candidate = `sk-${'c3'.repeat(16)}`
+  try {
+    assert.equal(
+      (
+        await call('/api/settings/api-key', {
+          method: 'PUT',
+          cookie: alice.cookie,
+          body: { apiKey: candidate },
+        })
+      ).status,
+      200
+    )
+    const ciphertext = db.db
+      .prepare('SELECT api_key_ciphertext FROM users WHERE id = ?')
+      .get(alice.user.id).api_key_ciphertext
+    env.API_KEY_ENCRYPTION_KEY = 'a-different-encryption-secret-with-more-than-32-characters'
+    const beforeRead = upstreamCalls.length
+    assert.equal((await call('/api/models', { cookie: alice.cookie })).status, 503)
+    assert.equal(upstreamCalls.length, beforeRead)
+    env.API_KEY_ENCRYPTION_KEY = secret
+    assert.equal((await call('/api/models', { cookie: alice.cookie })).status, 200)
+    assert.equal(upstreamCalls.at(-1).headers.get('Authorization'), `Bearer ${candidate}`)
+    for (const damaged of ['broken', `${ciphertext.slice(0, -4)}AAAA`]) {
+      db.db
+        .prepare('UPDATE users SET api_key_ciphertext = ? WHERE id = ?')
+        .run(damaged, alice.user.id)
+      const beforeDamaged = upstreamCalls.length
+      assert.equal((await call('/api/models', { cookie: alice.cookie })).status, 503)
+      assert.equal(upstreamCalls.length, beforeDamaged)
+    }
+    assert.equal(
+      (await call('/api/settings/api-key', { method: 'DELETE', cookie: alice.cookie })).status,
+      204
+    )
+    assert.equal((await call('/api/models', { cookie: alice.cookie })).status, 200)
+    assert.equal(
+      upstreamCalls.at(-1).headers.get('Authorization'),
+      `Bearer ${env.DEEPSEEK_API_KEY}`
+    )
+  } finally {
+    env.API_KEY_ENCRYPTION_KEY = secret
+    await call('/api/settings/api-key', { method: 'DELETE', cookie: alice.cookie })
+  }
+})
+
 test('administrator account guards, password resets, disabling and chat cleanup', async () => {
   assert.equal(
     (await call(`/api/admin/users/${admin.user.id}`, { method: 'DELETE', cookie: admin.cookie }))
@@ -1153,6 +1274,179 @@ test('streaming chat responses renew the application cookie without forwarding u
     assert.match(await response.text(), /message_stop/)
     assert.equal((await sessionRecord(account.cookie)).expires_at, Date.now() + 7 * DAY)
   })
+})
+
+test('无效凭据和异常校验响应不能覆盖已保存的自定义 API Key', async () => {
+  const account = await renewalAccount('key_validation')
+  const candidate = `sk-${'d4'.repeat(16)}`
+  const fetchBefore = globalThis.fetch
+  const storedKey = () =>
+    db.db.prepare('SELECT api_key_ciphertext FROM users WHERE id = ?').get(account.user.id)
+      .api_key_ciphertext
+  try {
+    assert.equal(
+      (
+        await call('/api/settings/api-key', {
+          method: 'PUT',
+          cookie: account.cookie,
+          body: { apiKey: candidate },
+        })
+      ).status,
+      200
+    )
+    const ciphertext = storedKey()
+    const responses = [
+      [401, () => Response.json({ error: { message: 'Invalid API key' } }, { status: 401 })],
+      [402, () => Response.json({ error: { message: 'Insufficient balance' } }, { status: 402 })],
+      [429, () => Response.json({ error: { message: 'Rate limited' } }, { status: 429 })],
+      [500, () => Response.json({ error: { message: 'Service failed' } }, { status: 500 })],
+      [
+        502,
+        () =>
+          new Response(null, { status: 302, headers: { Location: 'https://other.example.com/' } }),
+      ],
+      [502, () => new Response('<html>Sign in</html>')],
+      [502, () => Response.json({ error: { message: 'unexpected error' } })],
+    ]
+    for (const [expected, response] of responses) {
+      globalThis.fetch = async () => response()
+      const saved = await call('/api/settings/api-key', {
+        method: 'PUT',
+        cookie: account.cookie,
+        body: { apiKey: `sk-${'e5'.repeat(16)}` },
+      })
+      assert.equal(saved.status, expected)
+      assert.equal(saved.headers.get('X-Auth-Expired'), null)
+      assert.equal(storedKey(), ciphertext)
+    }
+  } finally {
+    globalThis.fetch = fetchBefore
+  }
+})
+
+test('保存和清除自定义 API Key 在提交时检查会话，撤销后的请求不能修改凭据', async () => {
+  for (const method of ['PUT', 'DELETE']) {
+    const account = await renewalAccount(`key_revoke_${method.toLowerCase()}`)
+    const candidate = `sk-${'f6'.repeat(16)}`
+    assert.equal(
+      (
+        await call('/api/settings/api-key', {
+          method: 'PUT',
+          cookie: account.cookie,
+          body: { apiKey: candidate },
+        })
+      ).status,
+      200
+    )
+    const ciphertext = db.db
+      .prepare('SELECT api_key_ciphertext FROM users WHERE id = ?')
+      .get(account.user.id).api_key_ciphertext
+    const response = await beforeStatement(
+      (sql) => sql.startsWith('UPDATE users SET api_key_ciphertext'),
+      () => call('/api/auth/logout', { method: 'POST', cookie: account.cookie }),
+      () =>
+        call('/api/settings/api-key', {
+          method,
+          cookie: account.cookie,
+          ...(method === 'PUT' ? { body: { apiKey: 'sk-replacement' } } : {}),
+        })
+    )
+    assert.equal(response.status, 401)
+    assert.equal(
+      db.db.prepare('SELECT api_key_ciphertext FROM users WHERE id = ?').get(account.user.id)
+        .api_key_ciphertext,
+      ciphertext
+    )
+  }
+})
+
+test('API Key 校验等待期间发生密码重置或会话过期时不能提交', async () => {
+  for (const change of ['password', 'expiration']) {
+    const account = await renewalAccount(`key_guard_${change}`)
+    const session = await sessionRecord(account.cookie)
+    const response = await beforeStatement(
+      (sql) => sql.startsWith('UPDATE users SET api_key_ciphertext'),
+      async () => {
+        if (change === 'password') {
+          db.db
+            .prepare('UPDATE users SET password_hash = ? WHERE id = ?')
+            .run('changed-password-hash', account.user.id)
+        } else {
+          db.db
+            .prepare('UPDATE auth_sessions SET absolute_expires_at = ? WHERE token_hash = ?')
+            .run(Date.now() - 1, session.token_hash)
+        }
+      },
+      () =>
+        call('/api/settings/api-key', {
+          method: 'PUT',
+          cookie: account.cookie,
+          body: { apiKey: 'sk-candidate' },
+        })
+    )
+    assert.equal(response.status, 401)
+    assert.equal(
+      db.db.prepare('SELECT api_key_ciphertext FROM users WHERE id = ?').get(account.user.id)
+        .api_key_ciphertext,
+      null
+    )
+  }
+})
+
+test('自定义 API Key 接受 sk 格式及首尾空格，拒绝控制字符，失败请求保留原凭据', async () => {
+  const account = await renewalAccount('key_boundaries')
+  const key = `sk-${'ab'.repeat(16)}`
+  const save = (apiKey) =>
+    call('/api/settings/api-key', {
+      method: 'PUT',
+      cookie: account.cookie,
+      body: { apiKey },
+    })
+  const storedKey = () =>
+    db.db.prepare('SELECT api_key_ciphertext FROM users WHERE id = ?').get(account.user.id)
+      .api_key_ciphertext
+  const originalFetch = globalThis.fetch
+  try {
+    assert.equal((await save(`  ${key}  `)).status, 200)
+    assert.equal(await decryptApiKey(storedKey(), env.API_KEY_ENCRYPTION_KEY), key)
+    const ciphertext = storedKey()
+    for (const invalid of [
+      '',
+      ' ',
+      'x'.repeat(513),
+      `${key}\n`,
+      `sk-\rsecret`,
+      'sk-\tsecret',
+      'sk-\0secret',
+      'sk-中文',
+      123,
+    ]) {
+      const before = upstreamCalls.length
+      assert.equal((await save(invalid)).status, 400)
+      assert.equal(upstreamCalls.length, before)
+      assert.equal(storedKey(), ciphertext)
+    }
+    globalThis.fetch = async () => {
+      throw new TypeError('network unavailable')
+    }
+    assert.equal((await save(key)).status, 502)
+    assert.equal(storedKey(), ciphertext)
+    globalThis.fetch = originalFetch
+    db.beforeExecute = (sql) => {
+      if (sql.startsWith('UPDATE users SET api_key_ciphertext')) {
+        throw new Error('database unavailable')
+      }
+    }
+    assert.equal((await save(key)).status, 500)
+    assert.equal(storedKey(), ciphertext)
+    db.beforeExecute = undefined
+    assert.equal((await save('x'.repeat(512))).status, 200)
+    assert.equal((await save(null)).status, 200)
+    assert.equal(storedKey(), null)
+  } finally {
+    globalThis.fetch = originalFetch
+    db.beforeExecute = undefined
+  }
 })
 
 test('session migration revokes legacy tokens, preserves data and advances credential versions', () => {

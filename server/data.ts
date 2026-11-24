@@ -1,6 +1,15 @@
 import { Hono } from 'hono'
 import { HTTPException } from 'hono/http-exception'
-import { encryptApiKey, hashPassword, randomToken, sha256 } from './security.js'
+import {
+  assertApiKeyEncryptionConfigured,
+  encryptApiKey,
+  hashPassword,
+  randomToken,
+  sha256,
+  validateCustomApiKey,
+} from './security.js'
+import { rateLimit } from './auth.js'
+import { verifyCustomApiKey } from './proxy.js'
 import type { AppEnv } from './types.js'
 
 const MAX_SESSION_BYTES = 900 * 1024
@@ -742,28 +751,38 @@ dataRoutes.put('/settings/api-key', async (c) => {
     return errorResponse('apiKey must be a string or null')
   }
 
-  const apiKey = typeof body.apiKey === 'string' ? body.apiKey.trim() : null
-  if (apiKey !== null && (apiKey.length === 0 || apiKey.length > 512 || /[\r\n]/.test(apiKey))) {
-    return errorResponse('Invalid API key')
+  const apiKey = body.apiKey === null ? null : validateCustomApiKey(body.apiKey)
+  if (apiKey !== null) {
+    assertApiKeyEncryptionConfigured(c.env.API_KEY_ENCRYPTION_KEY)
+    await rateLimit(c, `verify-key:${user.id}`, 20)
+    const failure = await verifyCustomApiKey(c, apiKey)
+    if (failure) {
+      return failure
+    }
   }
   const ciphertext =
     apiKey === null ? null : await encryptApiKey(apiKey, c.env.API_KEY_ENCRYPTION_KEY)
-  const result = await c.env.DB.prepare('UPDATE users SET api_key_ciphertext = ? WHERE id = ?')
-    .bind(ciphertext, user.id)
+  // 校验涉及上游等待，提交时必须再次确认会话仍有效。
+  const result = await c.env.DB.prepare(
+    `UPDATE users SET api_key_ciphertext = ? WHERE id = ? AND ${liveSessionSql}`
+  )
+    .bind(ciphertext, user.id, c.get('sessionTokenHash'), user.id, Date.now())
     .run()
   if (result.meta.changes === 0) {
-    return errorResponse('User not found', 404)
+    throw new HTTPException(401, { message: '登录已失效，请重新登录' })
   }
   return jsonResponse({ hasCustomApiKey: ciphertext !== null })
 })
 
 dataRoutes.delete('/settings/api-key', async (c) => {
   const user = c.get('user')
-  const result = await c.env.DB.prepare('UPDATE users SET api_key_ciphertext = NULL WHERE id = ?')
-    .bind(user.id)
+  const result = await c.env.DB.prepare(
+    `UPDATE users SET api_key_ciphertext = NULL WHERE id = ? AND ${liveSessionSql}`
+  )
+    .bind(user.id, c.get('sessionTokenHash'), user.id, Date.now())
     .run()
   if (result.meta.changes === 0) {
-    return errorResponse('User not found', 404)
+    throw new HTTPException(401, { message: '登录已失效，请重新登录' })
   }
   return noContent()
 })

@@ -1,6 +1,6 @@
 import { Hono, type Context } from 'hono'
 import { HTTPException } from 'hono/http-exception'
-import { decryptApiKey, sha256 } from './security.js'
+import { decryptApiKey, sha256, validateCustomApiKey } from './security.js'
 import { jsonBody, rateLimit } from './auth.js'
 import type { AppEnv } from './types.js'
 
@@ -38,8 +38,9 @@ const upstreamFetch = async (
   path: string,
   init: RequestInit
 ): Promise<Response> => {
+  const origin = upstreamOrigin(c)
   try {
-    return await fetch(`${upstreamOrigin(c)}${path}`, {
+    return await fetch(`${origin}${path}`, {
       ...init,
       redirect: 'manual',
       signal: c.req.raw.signal,
@@ -110,20 +111,46 @@ const assertFileOwnership = async (
 
 export const proxyRoutes = new Hono<AppEnv>()
 
+/** 校验成功响应的模型列表；上游鉴权失败保留原状态，避免误撤销站内登录。 */
+export const verifyCustomApiKey = async (
+  c: Context<AppEnv>,
+  key: string
+): Promise<Response | null> => {
+  const response = await upstreamFetch(c, '/models', { headers: upstreamHeaders(key) })
+  if (!response.ok) {
+    return forwarded(response)
+  }
+  let body: unknown
+  try {
+    body = await response.json()
+  } catch {
+    throw new HTTPException(502, { message: 'DeepSeek 校验响应异常，无法确认 API Key 是否有效' })
+  }
+  if (
+    typeof body !== 'object' ||
+    body === null ||
+    !('data' in body) ||
+    !Array.isArray(body.data) ||
+    body.data.length === 0 ||
+    !body.data.every(
+      (model: unknown) =>
+        typeof model === 'object' &&
+        model !== null &&
+        'id' in model &&
+        typeof model.id === 'string' &&
+        model.id.length > 0
+    )
+  ) {
+    throw new HTTPException(502, { message: 'DeepSeek 校验响应异常，无法确认 API Key 是否有效' })
+  }
+  return null
+}
+
 proxyRoutes.post('/settings/api-key/verify', async (c) => {
   await rateLimit(c, `verify-key:${c.get('user').id}`, 20)
   const body = await jsonBody(c)
-  if (
-    typeof body.apiKey !== 'string' ||
-    !body.apiKey.trim() ||
-    body.apiKey.length > 512 ||
-    /[\r\n]/.test(body.apiKey)
-  ) {
-    throw new HTTPException(400, { message: '请输入有效的自定义 API Key' })
-  }
-  return forwarded(
-    await upstreamFetch(c, '/models', { headers: upstreamHeaders(body.apiKey.trim()) })
-  )
+  const key = validateCustomApiKey(body.apiKey)
+  return (await verifyCustomApiKey(c, key)) ?? c.body(null, 204)
 })
 
 proxyRoutes.get('/models', async (c) =>

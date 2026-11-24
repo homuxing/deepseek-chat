@@ -106,18 +106,35 @@ export type BackendSettings = {
 export const getSettings = async (signal?: AbortSignal): Promise<BackendSettings> =>
   (await request(`${API_ORIGIN}/settings`, { method: 'GET', signal })).json()
 
-/** 保存当前用户的自定义 API Key；API Key 只发送给服务端。 */
+/** 服务端校验并保存当前用户的自定义 API Key。 */
 export const saveCustomApiKey = async (apiKey: string): Promise<void> => {
-  await request(`${API_ORIGIN}/settings/api-key`, {
+  const response = await request(`${API_ORIGIN}/settings/api-key`, {
     method: 'PUT',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ apiKey }),
   })
+  let settings: unknown
+  try {
+    settings = await response.json()
+  } catch {
+    throw new ApiError('protocol', { key: 'apiKeySaveUnconfirmed' })
+  }
+  if (
+    typeof settings !== 'object' ||
+    settings === null ||
+    !('hasCustomApiKey' in settings) ||
+    settings.hasCustomApiKey !== true
+  ) {
+    throw new ApiError('protocol', { key: 'apiKeySaveUnconfirmed' })
+  }
 }
 
 /** 清除当前用户的自定义 API Key，回退到部署配置的默认 Key。 */
 export const clearCustomApiKey = async (): Promise<void> => {
-  await request(`${API_ORIGIN}/settings/api-key`, { method: 'DELETE' })
+  const response = await request(`${API_ORIGIN}/settings/api-key`, { method: 'DELETE' })
+  if (response.status !== 204) {
+    throw new ApiError('protocol', { key: 'apiKeyClearUnconfirmed' })
+  }
 }
 
 /**

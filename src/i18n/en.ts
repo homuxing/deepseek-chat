@@ -113,7 +113,7 @@ export const en = {
   avatarMenuSettingsDialogThemeSelectSystemOption: 'System',
   apiKeyStart: 'Enter an API Key to get started',
   apiKeyCustomLabel: 'Custom API Key (optional)',
-  apiKeyFallbackDescription: 'Leave this empty to use the API Key configured for this deployment.',
+  apiKeyFallbackDescription: 'When unset, use the API Key provided by the administrator.',
   apiKeyEdit: 'Edit API Key',
   apiKeyPlaceholder: 'Enter API Key',
   apiKeyVerifying: 'Verifying...',
@@ -123,6 +123,10 @@ export const en = {
   apiKeyInvalid: 'Invalid API Key. Please check it and try again.',
   apiKeyVerificationFailed: 'Verification failed: {message}',
   apiKeySaveFailed: 'Unable to save the custom API Key: {message}',
+  apiKeySaveUnconfirmed:
+    'Unable to confirm that the API Key was saved. Please check the service status.',
+  apiKeyClearUnconfirmed:
+    'Unable to confirm that the API Key was cleared. Please check the service status.',
   apiKeyClearFailed: 'Unable to clear the custom API Key: {message}',
   historyImport: 'Import chat history',
   historyImportConfirm: 'Import',

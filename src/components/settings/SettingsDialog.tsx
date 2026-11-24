@@ -74,7 +74,7 @@ const SettingsContent = () => {
         className={styles.dialog}
         mainClassName={styles.dialogMain}
         onClose={() => {
-          if (!historyDelete.busy) {
+          if (!historyDelete.busy && !apiKeyEditor.form.verifying) {
             closeSettings()
           }
         }}

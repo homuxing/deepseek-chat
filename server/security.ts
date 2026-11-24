@@ -89,10 +89,23 @@ export const verifyPassword = async (password: string, encoded: string): Promise
   }
 }
 
-const encryptionKey = async (secret: string): Promise<CryptoKey> => {
-  if (!secret || secret.length < 32) {
-    throw new HTTPException(503, { message: '请配置至少 32 字符的 API_KEY_ENCRYPTION_KEY Secret' })
+export const validateCustomApiKey = (value: unknown): string => {
+  const key = typeof value === 'string' ? value.trim() : ''
+  // 凭据必须能安全放入 HTTP 请求头；实际有效性由 DeepSeek 校验。
+  if (typeof value !== 'string' || /[\r\n]/.test(value) || !/^[\x21-\x7e]{1,512}$/.test(key)) {
+    throw new HTTPException(400, { message: '请输入有效的自定义 API Key' })
   }
+  return key
+}
+
+export const assertApiKeyEncryptionConfigured = (secret: string | undefined): void => {
+  if (!secret || secret.length < 32) {
+    throw new HTTPException(503, { message: '自定义 API Key 服务配置异常，请联系管理员' })
+  }
+}
+
+const encryptionKey = async (secret: string): Promise<CryptoKey> => {
+  assertApiKeyEncryptionConfigured(secret)
   return crypto.subtle.importKey(
     'raw',
     await crypto.subtle.digest('SHA-256', encoder.encode(secret)),
@@ -113,15 +126,22 @@ export const encryptApiKey = async (plaintext: string, secret: string): Promise<
 }
 
 export const decryptApiKey = async (ciphertext: string, secret: string): Promise<string> => {
-  const [version, iv, data] = ciphertext.split('.')
-  if (version !== 'v1' || !iv || !data) {
-    throw new Error('Invalid encrypted API key')
-  }
-  return new TextDecoder().decode(
-    await crypto.subtle.decrypt(
-      { name: 'AES-GCM', iv: fromBase64(iv) as BufferSource },
-      await encryptionKey(secret),
-      fromBase64(data) as BufferSource
+  const key = await encryptionKey(secret)
+  try {
+    const [version, iv, data, extra] = ciphertext.split('.')
+    if (version !== 'v1' || !iv || !data || extra !== undefined) {
+      throw new Error('Invalid encrypted API key')
+    }
+    return new TextDecoder().decode(
+      await crypto.subtle.decrypt(
+        { name: 'AES-GCM', iv: fromBase64(iv) as BufferSource },
+        key,
+        fromBase64(data) as BufferSource
+      )
     )
-  )
+  } catch {
+    throw new HTTPException(503, {
+      message: '无法读取已保存的 API Key，请重新设置或联系管理员',
+    })
+  }
 }

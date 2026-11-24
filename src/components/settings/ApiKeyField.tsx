@@ -44,6 +44,7 @@ export const ApiKeyField = ({ editor }: { editor: ApiKeyEditor }) => {
                 tone="primary"
                 icon={<IconEditOutline16 />}
                 tooltip={t('apiKeyEdit')}
+                disabled={form.verifying}
                 onClick={() => setEditing(true)}
               />
             </div>
@@ -58,6 +59,7 @@ export const ApiKeyField = ({ editor }: { editor: ApiKeyEditor }) => {
               // 移动端打开设置时不弹键盘，点编辑后才聚焦
               autoFocus={!isMobile || editing}
               value={form.value}
+              disabled={form.verifying}
               onChange={(event) => form.setValue(event.target.value)}
               onKeyDown={(event) => {
                 if (event.key === 'Enter' && !event.nativeEvent.isComposing) {
