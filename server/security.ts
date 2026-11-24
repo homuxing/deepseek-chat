@@ -114,25 +114,17 @@ const encryptionKey = async (secret: string): Promise<CryptoKey> => {
   )
 }
 
-const encryptValue = async (
-  plaintext: string,
-  secret: string,
-  additionalData?: Uint8Array
-): Promise<string> => {
+const encryptValue = async (plaintext: string, secret: string): Promise<string> => {
   const iv = crypto.getRandomValues(new Uint8Array(12))
   const encrypted = await crypto.subtle.encrypt(
-    { name: 'AES-GCM', iv, additionalData: additionalData as BufferSource | undefined },
+    { name: 'AES-GCM', iv },
     await encryptionKey(secret),
     encoder.encode(plaintext)
   )
   return `v1.${toBase64(iv)}.${toBase64(new Uint8Array(encrypted))}`
 }
 
-const decryptValue = async (
-  ciphertext: string,
-  secret: string,
-  additionalData?: Uint8Array
-): Promise<string> => {
+const decryptValue = async (ciphertext: string, secret: string): Promise<string> => {
   const key = await encryptionKey(secret)
   const [version, iv, data, extra] = ciphertext.split('.')
   if (version !== 'v1' || !iv || !data || extra !== undefined) {
@@ -143,7 +135,6 @@ const decryptValue = async (
       {
         name: 'AES-GCM',
         iv: fromBase64(iv) as BufferSource,
-        additionalData: additionalData as BufferSource | undefined,
       },
       key,
       fromBase64(data) as BufferSource
@@ -164,37 +155,5 @@ export const decryptApiKey = async (ciphertext: string, secret: string): Promise
     throw new HTTPException(503, {
       message: '无法读取已保存的 API Key，请重新设置或联系管理员',
     })
-  }
-}
-
-const assertInviteEncryptionConfigured = (secret: string | undefined): void => {
-  if (!secret || secret.length < 32) {
-    throw new HTTPException(503, { message: '邀请码服务配置异常，请联系管理员' })
-  }
-}
-
-// 将邀请码密文绑定到用途及记录 ID，防止与其他凭据或邀请记录互换。
-const inviteEncryptionContext = (id: string): Uint8Array =>
-  encoder.encode(JSON.stringify(['deepseek-chat-invite-v1', id]))
-
-export const encryptInviteCode = async (
-  code: string,
-  id: string,
-  secret: string
-): Promise<string> => {
-  assertInviteEncryptionConfigured(secret)
-  return encryptValue(code, secret, inviteEncryptionContext(id))
-}
-
-export const decryptInviteCode = async (
-  ciphertext: string,
-  id: string,
-  secret: string
-): Promise<string> => {
-  assertInviteEncryptionConfigured(secret)
-  try {
-    return await decryptValue(ciphertext, secret, inviteEncryptionContext(id))
-  } catch {
-    throw new HTTPException(503, { message: '无法读取已保存的邀请码，请联系管理员' })
   }
 }

@@ -66,11 +66,13 @@ Keep the `SYNC` Durable Object binding and the `history-sync-v1` migration with 
 
 In Workers & Pages → deepseek-chat → Settings → Variables and Secrets, configure:
 
-- **Text:** `ADMIN_USERNAME` is set to `Admin` in `wrangler.jsonc` under `vars`. To change it, update the configuration and push (3–32 letters, digits, underscores or hyphens; case-insensitive).
+- **Text or Secret:** `ADMIN_USERNAME` (3–32 letters, digits, underscores or hyphens; case-insensitive). Set the administrator username in the Worker's runtime configuration.
 - **Optional Text:** `APP_ORIGIN` (site origin, e.g. `https://chat.example.com`), `DEEPSEEK_API_ORIGIN` (defaults to `https://api.deepseek.com`).
 - **Secret:** `ADMIN_PASSWORD` (10–128 characters), `DEEPSEEK_API_KEY`, `API_KEY_ENCRYPTION_KEY` (at least 32 random characters; keep a backup).
 
 `keep_vars: true` preserves dashboard text variables during deployment. Replacing the encryption secret makes existing saved API keys unreadable.
+
+`API_KEY_ENCRYPTION_KEY` encrypts custom API keys and requires at least 32 random characters. Invitation codes do not require this secret. Generate a key with `node -e "console.log(require('node:crypto').randomBytes(32).toString('base64url'))"`, keep a backup, and set it with `pnpm secret:put API_KEY_ENCRYPTION_KEY --config wrangler.jsonc`. A build environment variable does not provide the runtime secret for custom API keys.
 
 Bind a domain to the Worker and keep R2 public access disabled. The administrator signs in with `ADMIN_USERNAME` and `ADMIN_PASSWORD`. Changing either setting invalidates existing administrator sessions; ordinary users cannot register the configured administrator username.
 
@@ -78,7 +80,9 @@ Deployment runs `pnpm db:migrate:remote` automatically. The administrator passwo
 
 After administrator login, open Settings → General → Manage to create invitations and manage users.
 
-The invitation list shows the original code and its usage count. New codes are encrypted with `API_KEY_ENCRYPTION_KEY`; migration `0005_invite_codes.sql` preserves existing invitation records, usage counts, and expiration dates. Older records contain only a hash, so their original codes cannot be recovered; previously distributed codes remain valid for registration. Changing the encryption secret prevents saved codes from being displayed until the original secret is restored.
+Invitation codes are generated randomly and stored as their original strings for administrators to view and copy. Registration validates their hashes, usage limits, and expiration dates without an encryption key. Older records containing only a hash cannot recover their original codes; previously distributed codes remain valid for registration.
+
+`0006_plain_invite_codes.sql` adds the original-code column and preserves all existing records. Database migration commands convert saved invitation ciphertext, and deployment converts any ciphertext created during publication afterward. Existing ciphertext requires the original `API_KEY_ENCRYPTION_KEY`: remote conversion reads `.env.production.encryption` or the command environment; local conversion reads `.dev.vars` or the command environment. Use `node scripts/migrate-invite-codes.mjs --remote --key-file <key-file>` to supply a file containing that variable. An incorrect key or damaged record stops conversion and preserves the original data. After conversion, invitation creation, listing, and registration do not require the key.
 
 Ordinary sessions last seven days. A successful same-origin request renews a session when no more than one day remains, up to an absolute deadline of 30 days after login. Administrator sessions last one day, renew when no more than six hours remain, and require login again after seven days. Expired sessions require login; renewal does not use background polling.
 

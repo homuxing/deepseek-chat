@@ -14,11 +14,11 @@
     "lint": "oxlint src server rspack.config.ts",
     "test": "node --test --test-concurrency=1 tests/*.test.mjs",
     "deploy": "pnpm build && pnpm deploy:worker",
-    "deploy:worker": "pnpm db:migrate:remote && wrangler deploy --config wrangler.jsonc",
+    "deploy:worker": "pnpm db:migrate:remote && wrangler deploy --config wrangler.jsonc && node scripts/migrate-invite-codes.mjs --remote --clear-ciphertext",
     "deploy:dry-run": "wrangler deploy --config wrangler.jsonc --dry-run",
     "secret:put": "wrangler secret put",
-    "db:migrate:local": "wrangler d1 migrations apply DB --local --config wrangler.jsonc",
-    "db:migrate:remote": "wrangler d1 migrations apply DB --remote --config wrangler.jsonc",
+    "db:migrate:local": "wrangler d1 migrations apply DB --local --config wrangler.jsonc && node scripts/migrate-invite-codes.mjs --local",
+    "db:migrate:remote": "wrangler d1 migrations apply DB --remote --config wrangler.jsonc && node scripts/migrate-invite-codes.mjs --remote",
     "format": "oxfmt --write ."
   },
   "dependencies": {

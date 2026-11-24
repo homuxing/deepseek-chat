@@ -419,8 +419,8 @@ test('管理员重新登录后可读取原邀请码，列表与数据库中的�
   const stored = db.db.prepare('SELECT * FROM invites WHERE id = ?').get(invite.id)
   assert.notEqual(invite.code, invite.id)
   assert.equal(stored.code_hash, await sha256(invite.code))
-  assert.match(stored.code_ciphertext, /^v1\./)
-  assert.ok(!JSON.stringify(stored).includes(invite.code))
+  assert.equal(stored.code, invite.code)
+  assert.equal(stored.code_ciphertext, null)
 
   const login = await call('/api/admin/login', {
     method: 'POST',
@@ -473,48 +473,64 @@ test('历史邀请码保留原注册能力，记录 ID 无法用于注册', asyn
   }
 })
 
-test('邀请码读取和创建失败如实报错，恢复密钥或密文后继续读取原码', async () => {
-  const invite = await createInvite(admin.cookie)
-  const other = await createInvite(admin.cookie)
-  const stored = db.db.prepare('SELECT * FROM invites WHERE id = ?').get(invite.id)
-  const otherCiphertext = db.db
-    .prepare('SELECT code_ciphertext FROM invites WHERE id = ?')
-    .get(other.id).code_ciphertext
+test('邀请码生成、读取和注册独立于自定义 API Key 加密配置', async () => {
   const secret = env.API_KEY_ENCRYPTION_KEY
   try {
-    for (const invalidSecret of [
+    for (const [index, invalidSecret] of [
       undefined,
+      '',
       'short',
-      'different-secret-with-at-least-32-characters',
-    ]) {
+      'x'.repeat(31),
+      'x'.repeat(32),
+    ].entries()) {
       env.API_KEY_ENCRYPTION_KEY = invalidSecret
-      const response = await call('/api/admin/invites', { cookie: admin.cookie })
-      assert.equal(response.status, 503)
-      const failed = await response.json()
-      assert.equal(failed.invites, undefined)
-      assert.match(failed.error.message, /邀请码/)
-      assert.ok(!JSON.stringify(failed).includes(stored.code_ciphertext))
-      if (invalidSecret === undefined || invalidSecret === 'short') {
-        const count = db.db.prepare('SELECT COUNT(*) AS n FROM invites').get().n
-        const created = await call('/api/admin/invites', {
-          method: 'POST',
-          cookie: admin.cookie,
-          body: { maxUses: 1 },
-        })
-        assert.equal(created.status, 503)
-        assert.equal(db.db.prepare('SELECT COUNT(*) AS n FROM invites').get().n, count)
+      const count = db.db.prepare('SELECT COUNT(*) AS n FROM invites').get().n
+      const invite = await createInvite(admin.cookie)
+      assert.match(invite.code, /^[A-Za-z0-9_-]{43}$/)
+      assert.equal(db.db.prepare('SELECT COUNT(*) AS n FROM invites').get().n, count + 1)
+      const stored = db.db.prepare('SELECT * FROM invites WHERE id = ?').get(invite.id)
+      assert.equal(stored.code, invite.code)
+      assert.equal(stored.code_hash, await sha256(invite.code))
+      assert.equal(stored.code_ciphertext, null)
+      await register(`plain_invite_${index}`, invite.code, {
+        'CF-Connecting-IP': `plain-invite-${index}`,
+      })
+      for (const currentSecret of [invalidSecret, secret]) {
+        env.API_KEY_ENCRYPTION_KEY = currentSecret
+        const response = await call('/api/admin/invites', { cookie: admin.cookie })
+        assert.equal(response.status, 200)
+        const listed = (await response.json()).invites.find((item) => item.id === invite.id)
+        assert.equal(listed.code, invite.code)
+        assert.equal(listed.uses, 1)
       }
     }
+  } finally {
     env.API_KEY_ENCRYPTION_KEY = secret
-    for (const damaged of ['broken', otherCiphertext]) {
-      db.db.prepare('UPDATE invites SET code_ciphertext = ? WHERE id = ?').run(damaged, invite.id)
-      const response = await call('/api/admin/invites', { cookie: admin.cookie })
-      assert.equal(response.status, 503)
-      assert.equal((await response.json()).invites, undefined)
+  }
+})
+
+test('邀请码数据库读写失败如实报错，恢复连接后生成和读取正常', async () => {
+  const original = db.beforeExecute
+  try {
+    const count = db.db.prepare('SELECT COUNT(*) AS n FROM invites').get().n
+    db.beforeExecute = (sql) => {
+      if (/INSERT INTO invites|SELECT id, code_hash, code,/.test(sql)) {
+        throw new Error('模拟数据库不可用')
+      }
     }
-    db.db
-      .prepare('UPDATE invites SET code_ciphertext = ? WHERE id = ?')
-      .run(stored.code_ciphertext, invite.id)
+    const failedCreate = await call('/api/admin/invites', {
+      method: 'POST',
+      cookie: admin.cookie,
+      body: { maxUses: 1 },
+    })
+    assert.equal(failedCreate.status, 500)
+    assert.equal((await failedCreate.json()).invite, undefined)
+    assert.equal(db.db.prepare('SELECT COUNT(*) AS n FROM invites').get().n, count)
+    const failedList = await call('/api/admin/invites', { cookie: admin.cookie })
+    assert.equal(failedList.status, 500)
+    assert.equal((await failedList.json()).invites, undefined)
+    db.beforeExecute = original
+    const invite = await createInvite(admin.cookie)
     const response = await call('/api/admin/invites', { cookie: admin.cookie })
     assert.equal(response.status, 200)
     assert.equal(
@@ -522,10 +538,35 @@ test('邀请码读取和创建失败如实报错，恢复密钥或密文后继�
       invite.code
     )
   } finally {
+    db.beforeExecute = original
+  }
+})
+
+test('未转换的邀请码原码如实报错，完成转换后无需密钥即可读取', async () => {
+  const invite = await createInvite(admin.cookie)
+  const secret = env.API_KEY_ENCRYPTION_KEY
+  try {
+    env.API_KEY_ENCRYPTION_KEY = undefined
+    db.db
+      .prepare('UPDATE invites SET code = NULL, code_ciphertext = ? WHERE id = ?')
+      .run('pending', invite.id)
+    const failed = await call('/api/admin/invites', { cookie: admin.cookie })
+    assert.equal(failed.status, 503)
+    assert.equal((await failed.json()).invites, undefined)
+    db.db
+      .prepare('UPDATE invites SET code = ?, code_ciphertext = NULL WHERE id = ?')
+      .run(invite.code, invite.id)
+    const recovered = await call('/api/admin/invites', { cookie: admin.cookie })
+    assert.equal(recovered.status, 200)
+    assert.equal(
+      (await recovered.json()).invites.find((item) => item.id === invite.id).code,
+      invite.code
+    )
+  } finally {
     env.API_KEY_ENCRYPTION_KEY = secret
     db.db
-      .prepare('UPDATE invites SET code_ciphertext = ? WHERE id = ?')
-      .run(stored.code_ciphertext, invite.id)
+      .prepare('UPDATE invites SET code = ?, code_ciphertext = NULL WHERE id = ?')
+      .run(invite.code, invite.id)
   }
 })
 

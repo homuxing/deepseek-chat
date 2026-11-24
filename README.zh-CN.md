@@ -66,11 +66,13 @@ pnpm deploy
 
 在 Workers & Pages → deepseek-chat → Settings → Variables and Secrets 配置：
 
-- **Text：** `ADMIN_USERNAME` 已在 `wrangler.jsonc` 的 `vars` 中设置为 `Admin`。修改用户名时更新该配置并推送（3–32 位字母、数字、下划线或短横线，不区分大小写）。
+- **Text 或 Secret：** `ADMIN_USERNAME`（3–32 位字母、数字、下划线或短横线，不区分大小写）。在 Worker 运行时配置中填写管理员用户名。
 - **可选 Text：** `APP_ORIGIN`（站点地址，如 `https://chat.example.com`）、`DEEPSEEK_API_ORIGIN`（默认 `https://api.deepseek.com`）。
 - **Secret：** `ADMIN_PASSWORD`（10–128 个字符）、`DEEPSEEK_API_KEY`、`API_KEY_ENCRYPTION_KEY`（至少 32 个随机字符，妥善备份）。
 
 `keep_vars: true` 会在部署时保留后台文本变量。更换加密 Secret 后，已有自定义 API Key 无法解密。
+
+`API_KEY_ENCRYPTION_KEY` 用于加密自定义 API Key，至少包含 32 个随机字符，邀请码功能无需配置它。可以使用 `node -e "console.log(require('node:crypto').randomBytes(32).toString('base64url'))"` 生成密钥，妥善备份后执行 `pnpm secret:put API_KEY_ENCRYPTION_KEY --config wrangler.jsonc` 设置。仅在构建环境配置同名变量无法满足自定义 API Key 的运行时要求。
 
 给 Worker 绑定域名，R2 不开启公共访问。管理员使用 `ADMIN_USERNAME` 和 `ADMIN_PASSWORD` 登录，修改任意一项会使已有管理员会话失效。普通用户不能注册当前管理员用户名。
 
@@ -78,7 +80,9 @@ pnpm deploy
 
 管理员登录后，打开“设置 → 通用设置 → 管理”创建邀请码和管理用户。
 
-邀请码列表展示原邀请码及其使用次数。新建邀请码使用 `API_KEY_ENCRYPTION_KEY` 加密保存，`0005_invite_codes.sql` 迁移保留已有邀请记录、使用次数和有效期。历史记录仅保存哈希，原邀请码无法恢复，已分发的原码仍可注册。更换加密 Secret 后，新建邀请码的原码无法解密；恢复原 Secret 后可继续查看。
+邀请码随机生成后以原字符串保存，管理员可在列表中查看和复制；注册通过哈希校验邀请码及其使用次数和有效期，邀请码不依赖加密密钥。仅保存哈希的历史记录无法恢复原码，已分发的原码仍可注册。
+
+`0006_plain_invite_codes.sql` 添加原码列并保留全部现有记录。数据库迁移命令自动转换已保存的邀请码密文，部署后再处理发布期间产生的密文。转换已有密文需要原 `API_KEY_ENCRYPTION_KEY`，远程迁移从 `.env.production.encryption` 或命令环境读取，本地迁移从 `.dev.vars` 或命令环境读取；也可执行 `node scripts/migrate-invite-codes.mjs --remote --key-file <密钥文件>` 指定包含该变量的文件。密钥不正确或记录损坏会停止转换并保留原数据。转换完成后，邀请码生成、读取和注册均无需该密钥。
 
 普通用户登录有效期为 7 天，剩余不超过 1 天时，成功的站内请求会自动续期至 7 天后；首次登录后最多保持 30 天。管理员登录有效期为 1 天，剩余不超过 6 小时时自动续期，首次登录后最多保持 7 天。达到期限后需要重新登录；持续 7 天未访问的普通用户、持续 1 天未访问的管理员也需要重新登录。
 

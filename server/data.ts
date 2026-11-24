@@ -2,9 +2,7 @@ import { Hono, type Context } from 'hono'
 import { HTTPException } from 'hono/http-exception'
 import {
   assertApiKeyEncryptionConfigured,
-  decryptInviteCode,
   encryptApiKey,
-  encryptInviteCode,
   hashPassword,
   randomToken,
   sha256,
@@ -74,6 +72,7 @@ type AdminUserRow = {
 type InviteRow = {
   id: string
   code_hash: string
+  code: string | null
   code_ciphertext: string | null
   max_uses: number
   uses: number
@@ -189,15 +188,21 @@ const validateSession = (value: unknown): ValidatedSession | null => {
   return value as ValidatedSession
 }
 
-const inviteView = (row: InviteRow, code: string | null): InviteView => ({
-  id: row.id,
-  code,
-  maxUses: row.max_uses,
-  uses: row.uses,
-  expiresAt: row.expires_at,
-  createdBy: row.created_by,
-  createdAt: row.created_at,
-})
+const inviteView = (row: InviteRow): InviteView => {
+  // 未转换的原码需要如实报错；仅存哈希的历史记录才允许显示原码不可查看。
+  if (row.code === null && row.code_ciphertext !== null) {
+    throw new HTTPException(503, { message: '无法读取已保存的邀请码，请联系管理员' })
+  }
+  return {
+    id: row.id,
+    code: row.code,
+    maxUses: row.max_uses,
+    uses: row.uses,
+    expiresAt: row.expires_at,
+    createdBy: row.created_by,
+    createdAt: row.created_at,
+  }
+}
 
 const adminUserView = (row: AdminUserRow) => ({
   id: row.id,
@@ -782,31 +787,28 @@ adminRoutes.post('/invites', async (c) => {
   const id = crypto.randomUUID()
   const code = randomToken()
   const codeHash = await sha256(code)
-  const codeCiphertext = await encryptInviteCode(code, id, c.env.API_KEY_ENCRYPTION_KEY)
   const createdAt = Date.now()
   await c.env.DB.prepare(
     `INSERT INTO invites
-       (id, code_hash, code_ciphertext, max_uses, uses, expires_at, created_by, created_at)
+       (id, code_hash, code, max_uses, uses, expires_at, created_by, created_at)
      VALUES (?, ?, ?, ?, 0, ?, ?, ?)`
   )
-    .bind(id, codeHash, codeCiphertext, maxUses, expiresAt, user.id, createdAt)
+    .bind(id, codeHash, code, maxUses, expiresAt, user.id, createdAt)
     .run()
 
   return c.json(
     {
-      invite: inviteView(
-        {
-          id,
-          code_hash: codeHash,
-          code_ciphertext: codeCiphertext,
-          max_uses: maxUses,
-          uses: 0,
-          expires_at: expiresAt,
-          created_by: user.id,
-          created_at: createdAt,
-        },
-        code
-      ),
+      invite: inviteView({
+        id,
+        code_hash: codeHash,
+        code,
+        code_ciphertext: null,
+        max_uses: maxUses,
+        uses: 0,
+        expires_at: expiresAt,
+        created_by: user.id,
+        created_at: createdAt,
+      }),
     },
     201
   )
@@ -814,20 +816,11 @@ adminRoutes.post('/invites', async (c) => {
 
 adminRoutes.get('/invites', async (c) => {
   const rows = await c.env.DB.prepare(
-    `SELECT id, code_hash, code_ciphertext, max_uses, uses, expires_at, created_by, created_at
+    `SELECT id, code_hash, code, code_ciphertext, max_uses, uses, expires_at, created_by, created_at
      FROM invites
      ORDER BY created_at DESC, id ASC`
   ).all<InviteRow>()
-  const invites = await Promise.all(
-    rows.results.map(async (row) =>
-      inviteView(
-        row,
-        row.code_ciphertext === null
-          ? null
-          : await decryptInviteCode(row.code_ciphertext, row.id, c.env.API_KEY_ENCRYPTION_KEY)
-      )
-    )
-  )
+  const invites = rows.results.map(inviteView)
   return c.json({ invites })
 })
 
