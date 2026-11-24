@@ -71,6 +71,7 @@ const ImportProgressDialog = () => {
     return null
   }
   const status = historyImportStatus(progress)
+  const meter = importProgressMeter(progress, t)
   return (
     <Modal
       title={t(active ? 'historyImportInProgress' : 'historyImportErrorTitle')}
@@ -94,6 +95,29 @@ const ImportProgressDialog = () => {
         >
           {status ? t(status.key, status.params) : null}
         </div>
+        {meter ? (
+          <div className={styles.importMeter}>
+            <span>{meter.label}</span>
+            <div
+              className={clsx(
+                styles.importMeterTrack,
+                meter.indeterminate && styles.importMeterIndeterminate
+              )}
+              role="progressbar"
+              aria-label={t('historyImportInProgress')}
+              aria-valuemin={0}
+              aria-valuemax={100}
+              {...(meter.value === undefined
+                ? { 'aria-valuetext': meter.label }
+                : { 'aria-valuenow': meter.value, 'aria-valuetext': meter.label })}
+            >
+              <div
+                className={styles.importMeterFill}
+                style={meter.value === undefined ? undefined : { width: `${meter.value}%` }}
+              />
+            </div>
+          </div>
+        ) : null}
         {active ? <div className={styles.description}>{t('historyImportKeepOpen')}</div> : null}
       </div>
     </Modal>
@@ -537,15 +561,12 @@ const historyImportStatus = (progress: HistoryImportProgress): Status => {
   switch (progress.phase) {
     case 'idle':
       return null
-    case 'preparing':
-      return { key: 'historyImportPreparing', params: { percent: progress.preparedPercent ?? 0 } }
     case 'checking':
       return { key: 'historyImportChecking' }
     case 'uploading':
-      return {
-        key: 'historyImportUploading',
-        params: { sessions: progress.sessions, files: progress.files },
-      }
+      return { key: 'historyImportUploading' }
+    case 'processing':
+      return { key: 'historyImportProcessing' }
     case 'committing':
       return { key: 'historyImportCommitting' }
     case 'done':
@@ -560,6 +581,74 @@ const historyImportStatus = (progress: HistoryImportProgress): Status => {
       }
   }
   return null
+}
+
+type ImportProgressMeter = {
+  value?: number
+  label: string
+  indeterminate?: boolean
+}
+
+/**
+ * 进度条只呈现后端已确认的数据。总数缺失时保持不确定状态，
+ * 提交阶段显示真实数量，错误阶段保留已处理的正确数量。
+ */
+const importProgressMeter = (
+  progress: HistoryImportProgress,
+  t: ReturnType<typeof useTranslate>
+): ImportProgressMeter | null => {
+  const completed = progress.sessions + progress.files
+  const total =
+    progress.totalSessions === undefined || progress.totalFiles === undefined
+      ? undefined
+      : progress.totalSessions + progress.totalFiles
+  const count =
+    total === undefined
+      ? t('historyImportProgressCountUnknown', {
+          sessions: progress.sessions,
+          files: progress.files,
+        })
+      : t('historyImportProgressCount', {
+          completed,
+          sessions: progress.sessions,
+          files: progress.files,
+          total,
+        })
+  const percentLabel = (percent: number) => t('historyImportProgressPercent', { percent, count })
+  const indeterminateLabel = t('historyImportProgressWaiting', { count })
+
+  switch (progress.phase) {
+    case 'uploading': {
+      const percent = progress.preparedPercent
+      return percent === undefined
+        ? { label: indeterminateLabel, indeterminate: true }
+        : { value: Math.min(100, Math.max(0, percent)), label: percentLabel(percent) }
+    }
+    case 'checking':
+      return { label: indeterminateLabel, indeterminate: true }
+    case 'processing':
+    case 'committing':
+      if (total === undefined) {
+        return { label: indeterminateLabel, indeterminate: true }
+      }
+      if (total === 0) {
+        return { value: 100, label: percentLabel(100) }
+      }
+      {
+        const percent = Math.min(100, Math.floor((completed / total) * 100))
+        return { value: percent, label: percentLabel(percent) }
+      }
+    case 'error':
+      if (total === undefined || total === 0) {
+        return { label: t('historyImportProgressStopped', { count }), indeterminate: true }
+      }
+      {
+        const percent = Math.min(100, Math.floor((completed / total) * 100))
+        return { value: percent, label: t('historyImportProgressStopped', { count, percent }) }
+      }
+    default:
+      return null
+  }
 }
 
 /** 导入 = 覆盖：用选中文件替换本地全部会话与附件。 */

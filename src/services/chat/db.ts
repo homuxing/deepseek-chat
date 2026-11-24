@@ -209,6 +209,13 @@ export const loadHistorySnapshot = async (
   rememberVersion(result)
   return { ...result, sessions: result.sessions.map(toSessionSummary) }
 }
+/** 整包导入提交后直接使用返回的目录与版本，清除旧会话保存版本。 */
+export const acceptImportedHistory = (result: HistorySnapshot): SessionSummary[] => {
+  rememberVersion(result)
+  savedVersions.clear()
+  return result.sessions.map(toSessionSummary)
+}
+
 export const loadSessionSummaries = async (): Promise<SessionSummary[]> =>
   (await loadHistorySnapshot()).sessions
 export const loadSession = async (id: string): Promise<Session | undefined> => {
@@ -362,27 +369,92 @@ export const createCloudImport = async (identity: BackendIdentity, signal: Abort
   }
   const importId = started.id
   const fileIds = new Map<string, string>()
+  const fileTypes = new Map<string, string>()
+  const path = '/api/chats/imports/' + encodeURIComponent(importId)
+  const remapFile = (id: string) => {
+    let remapped = fileIds.get(id)
+    if (!remapped) {
+      remapped = crypto.randomUUID()
+      fileIds.set(id, remapped)
+    }
+    return remapped
+  }
+  const prepareSession = (source: Session) => {
+    const session = structuredClone(source)
+    for (const message of session.messages) {
+      if (message.role === 'user') {
+        message.files = message.files.map((file) => ({
+          ...file,
+          id: remapFile(file.id),
+          serverId: null,
+          mimeType: fileTypes.get(file.id) ?? file.mimeType,
+        }))
+      }
+    }
+    return session
+  }
   let sessions = 0
   let files = 0
+  const progress = () => {
+    assertBackendIdentity(identity)
+    signal.throwIfAborted()
+    setHistoryImportProgress({ phase: 'processing', sessions, files })
+  }
+  const saveBatch = async (sources: Session[]) => {
+    assertBackendIdentity(identity)
+    signal.throwIfAborted()
+    const batch = sources.map(prepareSession)
+    const body = JSON.stringify({ sessions: batch })
+    // 附件 ID 映射可能扩大 JSON，发送前再次按实际字节复核请求边界。
+    if (new Blob([body]).size > 256 * 1024 || batch.length > 16) {
+      if (sources.length === 1) {
+        const session = batch[0]
+        await uploadObject(
+          new Blob([JSON.stringify(session)], { type: 'application/json' }),
+          { kind: 'chat', id: session.id, importId },
+          identity,
+          signal
+        )
+        sessions++
+        progress()
+      } else {
+        const middle = Math.ceil(sources.length / 2)
+        await saveBatch(sources.slice(0, middle))
+        await saveBatch(sources.slice(middle))
+      }
+      return
+    }
+    const result = await connect(() =>
+      apiJson<{ count: number; sessions: SessionSummary[] }>(
+        path + '/chats',
+        { method: 'POST', headers: jsonHeaders, body, signal },
+        identity
+      )
+    )
+    if (
+      !result ||
+      result.count !== batch.length ||
+      !Array.isArray(result.sessions) ||
+      result.sessions.length !== batch.length ||
+      new Set(result.sessions.map((session) => session.id)).size !== batch.length ||
+      batch.some((session) => !result.sessions.some((saved) => saved.id === session.id))
+    ) {
+      throw new Error('无法确认全部会话已保存')
+    }
+    sessions += batch.length
+    progress()
+  }
   const sink: ArchiveImportSink = {
     async addSession(source) {
       assertBackendIdentity(identity)
-      const session = structuredClone(source)
-      for (const message of session.messages) {
-        if (message.role === 'user') {
-          message.files = message.files.map((file) => {
-            let remapped = fileIds.get(file.id)
-            if (!remapped) {
-              remapped = crypto.randomUUID()
-              fileIds.set(file.id, remapped)
-            }
-            // 每处引用创建独立对象，共享附件始终按原始 ID 映射。
-            return { ...file, id: remapped, serverId: null }
-          })
-        }
+      const session = prepareSession(source)
+      const body = new Blob([JSON.stringify(session)], { type: 'application/json' })
+      if (body.size + 15 <= 256 * 1024) {
+        await saveBatch([source])
+        return
       }
       await uploadObject(
-        new Blob([JSON.stringify(session)], { type: 'application/json' }),
+        body,
         {
           kind: 'chat',
           id: session.id,
@@ -391,31 +463,51 @@ export const createCloudImport = async (identity: BackendIdentity, signal: Abort
         identity,
         signal
       )
-      setHistoryImportProgress({ phase: 'uploading', sessions: ++sessions, files })
+      sessions++
+      progress()
     },
+    addSessions: saveBatch,
     async saveFiles(originals) {
       for (const file of originals) {
-        let id = fileIds.get(file.id)
-        if (!id) {
-          id = crypto.randomUUID()
-          fileIds.set(file.id, id)
+        assertBackendIdentity(identity)
+        signal.throwIfAborted()
+        const id = remapFile(file.id)
+        const mimeType = file.blob.type || 'application/octet-stream'
+        fileTypes.set(file.id, mimeType)
+        if (file.blob.size <= CHUNK_BYTES) {
+          const result = await connect(() =>
+            apiJson<{ id: string }>(
+              path + '/files/' + encodeURIComponent(id),
+              { method: 'PUT', headers: { 'Content-Type': mimeType }, body: file.blob, signal },
+              identity
+            )
+          )
+          if (!result || result.id !== id) {
+            throw new Error('无法确认附件已保存')
+          }
+        } else {
+          await uploadOriginal({ ...file, id }, identity, importId, signal)
         }
-        await uploadOriginal({ ...file, id }, identity, importId, signal)
-        setHistoryImportProgress({ phase: 'uploading', sessions, files: ++files })
+        files++
+        progress()
       }
     },
     async updateFileTypes() {
       assertBackendIdentity(identity)
     },
   }
-  const path = '/api/chats/imports/' + encodeURIComponent(importId)
   let committed = false
   return {
     sink,
     async commit(): Promise<SessionSummary[]> {
       assertBackendIdentity(identity)
       setHistoryImportProgress({ phase: 'committing', sessions, files })
-      let result: { generation: string; revision: number; count: number }
+      let result: {
+        generation: string
+        revision: number
+        count: number
+        sessions?: SessionSummary[]
+      }
       for (let attempt = 0; ; attempt++) {
         try {
           result = await apiJson(
@@ -453,14 +545,44 @@ export const createCloudImport = async (identity: BackendIdentity, signal: Abort
           await waitForImportConnection(identity, signal, attempt)
         }
       }
-      if (!result || result.count !== sessions) {
+      if (
+        !result ||
+        result.count !== sessions ||
+        typeof result.generation !== 'string' ||
+        result.generation.length === 0 ||
+        !Number.isSafeInteger(result.revision) ||
+        result.revision < 1
+      ) {
         throw new Error('无法确认完整历史已保存')
       }
       committed = true
       rememberVersion(result)
       savedVersions.clear()
       try {
-        return (await connect(() => loadHistorySnapshot(identity))).sessions
+        const listed =
+          result.sessions === undefined
+            ? await connect(() => loadHistorySnapshot(identity))
+            : {
+                generation: result.generation,
+                revision: result.revision,
+                sessions: result.sessions,
+              }
+        if (
+          listed.generation !== result.generation ||
+          !Array.isArray(listed.sessions) ||
+          listed.sessions.length !== sessions ||
+          new Set(listed.sessions.map((summary) => summary.id)).size !== sessions ||
+          listed.sessions.some(
+            (summary) =>
+              typeof summary.id !== 'string' ||
+              typeof summary.title !== 'string' ||
+              !Number.isSafeInteger(summary.createdAt) ||
+              !Number.isSafeInteger(summary.updatedAt)
+          )
+        ) {
+          throw new Error('导入后的历史目录已变化或不完整')
+        }
+        return acceptImportedHistory(listed)
       } catch (error) {
         throw new Error(
           '历史已保存至云端，但读取更新失败：' +
@@ -485,7 +607,7 @@ export const clearCloudHistory = async (
   savedVersions.clear()
   return (await loadHistorySnapshot(identity)).sessions
 }
-// 归档单元测试和调用方可使用内存暂存；生产导入使用逐条云端 sink。
+// 归档单元测试使用内存暂存；用户导入按有界并发边解析边上传。
 export const clearStaging = async (): Promise<void> => {
   stagingSessions.clear()
   stagingFiles.clear()

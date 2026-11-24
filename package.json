@@ -11,7 +11,7 @@
     "dev:worker": "wrangler dev",
     "build": "node scripts/build.mjs",
     "type": "tsc -p tsconfig.json && tsc -p tsconfig.worker.json",
-    "lint": "oxlint src server rspack.config.ts",
+    "lint": "oxlint src server shared rspack.config.ts",
     "test": "node --test --test-concurrency=1 tests/*.test.mjs",
     "deploy": "pnpm build && pnpm deploy:worker",
     "deploy:worker": "pnpm db:migrate:remote && wrangler deploy --config wrangler.jsonc && node scripts/migrate-invite-codes.mjs --remote --clear-ciphertext",

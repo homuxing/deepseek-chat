@@ -34,6 +34,10 @@ declare const styles: {
   readonly importConfirmText: string
   readonly importProgress: string
   readonly importSpinner: string
+  readonly importMeter: string
+  readonly importMeterTrack: string
+  readonly importMeterFill: string
+  readonly importMeterIndeterminate: string
   readonly deleteConfirm: string
   readonly deleteActions: string
 }

@@ -21,9 +21,9 @@ chat_sessions/{session_id}_files/{file_id}_{file_name}  图片、文档等附件
 
 ## 导入与替换
 
-1. 用户确认覆盖后，先读取首个条目检查格式与版本；不符合时直接失败，不中止正在生成的回答。
-2. 检查通过后停止生成，导入期间禁止修改会话。解析器逐会话转换并交给云端 sink 上传完整 JSON，原件到达时上传 R2；内存只保留当前会话或原件、会话 ID、索引计数、原件映射及内容指纹。sink 为附件生成新 ID，同一旧 ID 的全部引用共用新 ID，支持原件先于会话。
-3. 会话和原件上传至当前账号的独立导入代次，完成全部索引、消息树、附件映射和 ZIP 完整性校验后，才以 D1 事务切换当前目录。失败保留原有历史，取消并清理未完成导入；成功后清理旧代次及未引用原件。应用不设置会话数量、单会话正文或总 JSON 的业务容量上限，实际容量受浏览器资源和云服务平台约束。
+1. 用户确认覆盖后，导入期间停止生成并禁止修改会话。浏览器读取 ZIP 目录，统计对话数和按文件 ID 去重后的附件数，再逐条解压、校验和转换；导入绑定当前账号和唯一任务 ID，ZIP 本身不上传给后端。
+2. 小会话按最多 16 个且不超过 256 KiB 组成一批，通过 `POST /api/chats/imports/:id/chats` 写入；不超过 8 MiB 的附件使用直接 `PUT`，超过该大小的对象继续使用 multipart upload。会话批次与附件共用最多四个并发任务。共享原件首次读取后上传，后续副本仍进行大小、CRC 和完整内容指纹校验，全部校验通过后才能提交；同一旧 ID 的所有引用共用新 ID，支持原件先于会话。总量来自 ZIP 目录，已完成计数只在对象存储成功后增加，由阻断操作的进度蒙层展示。
+3. 会话与附件在独立导入版本中暂存。全部索引、消息树、附件映射和条目完整性校验完成后，D1 事务同时发布附件并切换历史目录。失败时停止新增任务，等待在途上传结束后清理本次暂存内容；成功后用响应中的完整目录自动更新界面。其他设备更新或登录失效会使提交失败，保留现有历史。结果响应丢失时确认已提交任务的结果，不重复上传。ZIP 解析在浏览器内完成，导入流程不依赖高额 `cpu_ms` 配置。实际容量仍受浏览器、Worker 和 Cloudflare 平台限制约束。
 
 消息树以 `id` / `parent_id` 还原，父消息 ID 必须小于子消息 ID、角色交替、根为提问。`current_message_id` 决定当前分支；其他节点默认选中 ID 最大的子消息。缺失原件的附件保留文件名和大小，不进入后续请求；有原件的导入图片在首次用于请求时上传。
 
@@ -33,11 +33,13 @@ chat_sessions/{session_id}_files/{file_id}_{file_name}  图片、文档等附件
 
 同一账号的设备通过 Durable Object `HistorySync` 的 WebSocket 接收变更通知，并自动读取最新目录与已打开会话。进入页面、操作完成、重新连接和页面恢复可见时自动同步，不使用固定轮询或手动刷新操作。通知仅携带状态，完整内容通过已鉴权接口读取。
 
-`importArchive(file, sink?)` 的可选 `ArchiveImportSink` 提供 `addSession`、`saveFiles` 和 `updateFileTypes`；默认使用 db staging，以兼容既有调用。正式云端入口传入 sink，账号检查和导入提交由调用方负责。`updateFileTypes` 仅在整包校验成功后调用一次，云端入口无需重写已上传会话 JSON。
+`shared/history/importArchive.ts` 提供不依赖浏览器状态的归档校验、转换与有界并发处理。`server/cloudStorage.ts` 提供会话批量写入、附件上传和提交事务。`src/services/chat/history/` 负责浏览器内解压和归档转换，导入上传、结果确认与进度展示由 `src/services/chat/` 中的导入服务完成。
 
 ## 云端部署
 
 `migrations/0004_cloud_history.sql` 添加云端目录代次、会话版本、R2 正文引用、附件引用及导入和 multipart upload 状态表，并保留现有用户与会话。现有 D1 会话正文仍可读取，后续写入使用 R2。部署前应用该迁移：本地运行 `pnpm db:migrate:local`，生产部署使用 `pnpm deploy` 或 `pnpm deploy:worker`，两者均在 Worker 发布前执行 `pnpm db:migrate:remote`。
+
+`migrations/0007_archive_import.sql` 添加的 `archive_mode` 字段与暂存附件记录保留兼容旧整包路径，新导入路径依赖 `migrations/0004_cloud_history.sql` 建立的目录、会话版本、附件及上传表。应应用全部迁移，避免环境之间出现表结构差异。
 
 `wrangler.jsonc` 需要 D1 `DB`、私有 R2 `FILES` 和 Durable Object `SYNC` 绑定。`SYNC` 指向 Worker 导出的 `HistorySync` 类，Durable Object 迁移使用 `history-sync-v1` 和 `new_sqlite_classes: ["HistorySync"]`。Wrangler 发布 Worker 时同时应用该 DO 迁移；D1 迁移和 DO 绑定均需完成，多设备通知依赖这份部署配置。
 
@@ -64,12 +66,12 @@ chat_sessions/{session_id}_files/{file_id}_{file_name}  图片、文档等附件
 
 ## 模块与 ZIP 支持
 
-| 文件                                                                           | 职责                              |
-| ------------------------------------------------------------------------------ | --------------------------------- |
-| [format.ts](./format.ts)、[schema.ts](./schema.ts)                             | 归档类型与字段校验                |
-| [toLocal.ts](./toLocal.ts)、[toArchive.ts](./toArchive.ts)                     | 归档与本地消息转换                |
-| [importArchive.ts](./importArchive.ts)、[exportArchive.ts](./exportArchive.ts) | 流式 sink、共享原件校验与归档组装 |
-| [zipReader.ts](./zipReader.ts)、[zipWriter.ts](./zipWriter.ts)                 | ZIP 读写及路径、大小、CRC 校验    |
-| [../backup.ts](../backup.ts)                                                   | 导入导出入口与串行队列            |
+| 文件                                                                           | 职责                                 |
+| ------------------------------------------------------------------------------ | ------------------------------------ |
+| [format.ts](./format.ts)、[schema.ts](./schema.ts)                             | 归档类型与字段校验                   |
+| [toLocal.ts](./toLocal.ts)、[toArchive.ts](./toArchive.ts)                     | 归档与本地消息转换                   |
+| [importArchive.ts](./importArchive.ts)、[exportArchive.ts](./exportArchive.ts) | 归档测试入口、共享原件校验与导出组装 |
+| [zipReader.ts](./zipReader.ts)、[zipWriter.ts](./zipWriter.ts)                 | ZIP 读写及路径、大小、CRC 校验       |
+| [../backup.ts](../backup.ts)                                                   | 导入导出入口与串行队列               |
 
 支持单卷 ZIP32 和 ZIP64 的 STORE / DEFLATE，导出使用 STORE。读取支持 ZIP64 目录、64 位大小与偏移和 64 位 data descriptor；写入在条目数量、大小或偏移达到 ZIP32 边界时自动使用 ZIP64。加密、分卷及非 UTF-8 的非 ASCII 文件名不支持；条目名统一按 NFC 比较，并校验路径、大小和 CRC。不另设业务大小上限，文件大小仍须处于 JavaScript 安全整数范围，导出会生成完整下载 Blob，实际受浏览器资源约束。

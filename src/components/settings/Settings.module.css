@@ -442,14 +442,66 @@
   animation: importSpin 0.8s linear infinite;
 }
 
+.importMeter {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  width: 100%;
+  max-width: 360px;
+  color: var(--dsw-alias-label-secondary);
+  font-size: 12px;
+  line-height: 18px;
+  text-align: left;
+}
+
+.importMeterTrack {
+  position: relative;
+  height: 8px;
+  overflow: hidden;
+  border-radius: 999px;
+  background-color: var(--dsw-alias-border-l2);
+}
+
+.importMeterFill {
+  width: 0;
+  height: 100%;
+  border-radius: inherit;
+  background-color: var(--dsw-alias-brand-primary);
+  transition: width 180ms ease-out;
+}
+
+.importMeterIndeterminate .importMeterFill {
+  width: 35%;
+  animation: importMeterSlide 1.2s ease-in-out infinite;
+}
+
 @keyframes importSpin {
   to {
     transform: rotate(360deg);
   }
 }
 
+@keyframes importMeterSlide {
+  from {
+    transform: translateX(-100%);
+  }
+
+  to {
+    transform: translateX(285%);
+  }
+}
+
 @media (prefers-reduced-motion: reduce) {
   .importSpinner {
+    animation: none;
+  }
+
+  .importMeterFill {
+    transition: none;
+  }
+
+  .importMeterIndeterminate .importMeterFill {
+    width: 100%;
     animation: none;
   }
 }

@@ -60,7 +60,7 @@ pnpm deploy
 
 `pnpm deploy` 构建前端、应用远程 D1 迁移，然后将前后端一起发布。
 
-云端历史需要应用 `migrations/0004_cloud_history.sql`。该迁移保留现有用户与会话，添加目录代次、会话版本、R2 正文引用、附件引用，以及导入和 multipart upload 状态记录。现有 D1 会话正文仍可读取，后续写入使用 R2。本地执行 `pnpm db:migrate:local`；`pnpm deploy` 和 `pnpm deploy:worker` 会在发布前应用远程迁移。
+云端历史依赖 `migrations/0004_cloud_history.sql`。该迁移保留现有用户与会话，添加目录代次、会话版本、R2 正文引用、附件引用，以及导入和 multipart upload 状态记录。现有 D1 会话正文仍可读取，后续写入使用 R2。本地执行 `pnpm db:migrate:local`；`pnpm deploy` 和 `pnpm deploy:worker` 会在发布前应用远程迁移。应应用全部迁移，避免环境之间出现表结构差异。
 
 保留 `wrangler.jsonc` 中的 `SYNC` Durable Object 绑定，以及 `history-sync-v1` 迁移的 `new_sqlite_classes: ["HistorySync"]`。Wrangler 发布导出 `HistorySync` 类的 Worker 时会同时应用该 DO 迁移。D1 迁移和 DO 部署均需完成，云端历史与多设备自动通知依赖这些配置。
 
@@ -102,9 +102,9 @@ GitHub Actions 在推送、PR 或手动触发时执行这些检查。生产自�
 
 ## 历史记录
 
-支持导入 `export_format_version: 3` 的官方 DeepSeek 历史 ZIP。会话逐条直接上传云端，保留完整消息树、当前分支、正文、思考、搜索结果和置顶属性；图片、文档及其他可取得的附件原件保存至 R2，共享附件在多个会话中保持统一文件标识。缺失原件保留元信息。应用不设置会话数量、单会话 JSON 或总 JSON 的业务容量上限，实际容量受浏览器资源和云服务平台约束。支持 ZIP32 和 ZIP64。
+支持导入 `export_format_version: 3` 的官方 DeepSeek 历史 ZIP。浏览器读取 ZIP 目录，统计对话数和去重后的附件数，再逐条解析并上传对象；ZIP 本身不会上传给后端。小会话按最多 16 个且不超过 256 KiB 组成一批，通过 `POST /chats/imports/:id/chats` 保存；不超过 8 MiB 的附件使用直接 `PUT`，更大的对象继续使用 multipart upload。共享原件会核对其所有引用位置，只上传一次；会话批次与附件共用最多四个并发任务。阻断操作的进度蒙层展示真实的已完成数量和全部数量。保留完整消息树、当前分支、正文、思考、搜索结果和置顶属性；图片、文档及其他可取得的附件原件保存至 R2，共享附件在多个会话中保持统一文件标识。缺失原件保留元信息，支持 ZIP32 和 ZIP64。ZIP 解析在浏览器内完成，导入流程不依赖高额 `cpu_ms` 配置。实际容量仍受浏览器、Worker 和 Cloudflare 平台限制约束。
 
-D1 保存当前用户的会话目录、版本与附件引用，R2 保存完整会话 JSON 和原件。上传及归档校验全部成功后才替换历史。使用同一账号的设备通过 Durable Object 通知自动读取最新历史，重新连接和返回页面时也会同步，无需固定轮询或手动刷新。详见[历史格式与云端部署](src/services/chat/history/README.md)。
+D1 保存当前用户的会话目录、版本与附件引用，R2 保存完整会话 JSON 和原件。全部对象保存并完成归档校验后，才原子切换历史。失败时停止新增任务，等待在途上传结束后清理暂存内容；账号和版本检查会阻止导入覆盖其他设备的新历史。使用同一账号的设备通过 Durable Object 通知自动读取最新历史，重新连接和返回页面时也会同步，无需固定轮询或手动刷新。详见[历史格式与云端部署](src/services/chat/history/README.md)。
 
 ## 许可证
 

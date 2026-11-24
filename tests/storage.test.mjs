@@ -224,8 +224,19 @@ test('暂存导入失败保留本地数据，重试使用新 ID 且共享附件�
     const uploads = []
     let commitAttempts = 0
     harness.intercept((request) => {
-      if (request.path === '/api/storage/uploads' && request.method === 'POST') {
-        uploads.push(JSON.parse(request.body))
+      if (/^\/api\/chats\/imports\/[^/]+\/chats$/.test(request.path) && request.method === 'POST') {
+        const source = JSON.parse(request.body).sessions[0]
+        uploads.push({ kind: 'chat', id: source.id, importId: request.path.split('/')[4] })
+      }
+      if (
+        /^\/api\/chats\/imports\/[^/]+\/files\/[^/]+$/.test(request.path) &&
+        request.method === 'PUT'
+      ) {
+        uploads.push({
+          kind: 'file',
+          id: request.path.split('/').at(-1),
+          importId: request.path.split('/')[4],
+        })
       }
       if (
         request.method === 'POST' &&
@@ -269,7 +280,7 @@ test('暂存导入失败保留本地数据，重试使用新 ID 且共享附件�
       const fileUpload = attempt.get('file')
       assert.ok(chatUpload)
       assert.ok(fileUpload)
-      // 上传请求只包含资源身份，正文和引用在 R2 中校验后发布。
+      // 两次导入使用独立映射，失败任务不能复用后续任务的附件标识。
       assert.equal(chatUpload.summary, undefined)
       assert.equal(chatUpload.files, undefined)
       assert.notEqual(fileUpload.id, oldFileId)

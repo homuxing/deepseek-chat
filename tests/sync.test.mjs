@@ -164,6 +164,33 @@ afterEach(() => {
   FakeWebSocket.instances = []
 })
 
+test('未知同步消息不改变本地导入进度，也不触发会话目录读取', async () => {
+  const { page } = installGlobals({ user: 'alice' })
+  const calls = []
+  const progress = []
+  const dispose = startSync(async () => {
+    calls.push('read')
+  })
+  page.addEventListener('history:import-progress', (event) => progress.push(event.detail))
+  const message = {
+    type: 'import-progress',
+    importId: 'task-a',
+    phase: 'processing',
+    sessions: 5,
+    files: 2,
+    totalSessions: 10,
+    totalFiles: 3,
+  }
+  const socket = FakeWebSocket.instances[0]
+  socket.emitMessage(message)
+  await flush()
+  assert.deepEqual(progress, [])
+  assert.deepEqual(calls, [])
+  dispose()
+  socket.emitMessage(message)
+  assert.equal(progress.length, 0)
+})
+
 test('连接同一账号并串行合并 initial ready 与 changed 通知', async () => {
   installGlobals({ user: 'alice' })
   createTimers()

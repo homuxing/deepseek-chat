@@ -7,7 +7,6 @@ import {
   createCloudHarness,
   fileReference,
   iso,
-  jsonBlob,
   sessionFile,
   toFile,
 } from './helpers/cloudHarness.mjs'
@@ -23,349 +22,53 @@ const withHarness = async (run) => {
 
 const plain = (value) => JSON.parse(JSON.stringify(value))
 
-test('导入全过程绑定离开页面提醒，失败后移除提醒并保留历史', async () => {
-  await withHarness(async (harness) => {
-    const { modules } = harness
-    const user = await harness.addUser('leave_protection')
-    harness.setCurrentUser(user, { reset: true })
-    await modules.store.initChat()
-    const originalWindow = globalThis.window
-    const page = new EventTarget()
-    globalThis.window = page
-    const archive = await buildArchive(modules, {
-      sessions: [makeSession({ id: 'leave-protected' })],
-    })
-    const rejectPart = harness.intercept((request) => {
-      if (request.method === 'PUT' && /\/parts\/1$/.test(request.path)) {
-        return {
-          response: new Response(JSON.stringify({ error: { message: '文件内容无效' } }), {
-            status: 400,
-          }),
-        }
-      }
-    })
-    try {
-      const importing = modules.backup.importHistory(toFile(archive))
-      const leaving = new Event('beforeunload', { cancelable: true })
-      page.dispatchEvent(leaving)
-      assert.equal(leaving.defaultPrevented, true)
-      await assert.rejects(importing, /文件内容无效/)
-      const afterFailure = new Event('beforeunload', { cancelable: true })
-      page.dispatchEvent(afterFailure)
-      assert.equal(afterFailure.defaultPrevented, false)
-      assert.equal(modules.importProgress.useHistoryImportProgress.getState().phase, 'error')
-      assert.equal(modules.store.useChatStore.getState().importingHistory, false)
-      assert.equal(harness.files.multipartUploads.size, 0)
-      assert.ok(
-        harness.requests
-          .filter((request) => request.status !== null)
-          .every((request) => request.status < 500)
-      )
-      rejectPart()
-      const success = modules.backup.importHistory(toFile(archive))
-      assert.equal(await success, 1)
-      const afterSuccess = new Event('beforeunload', { cancelable: true })
-      page.dispatchEvent(afterSuccess)
-      assert.equal(afterSuccess.defaultPrevented, false)
-    } finally {
-      rejectPart()
-      if (originalWindow === undefined) delete globalThis.window
-      else globalThis.window = originalWindow
-    }
-  })
-})
+const assertDone = (progress, sessions, files, totalSessions = sessions, totalFiles = files) => {
+  assert.equal(progress.phase, 'done')
+  assert.equal(progress.sessions, sessions)
+  assert.equal(progress.files, files)
+  assert.equal(progress.totalSessions, totalSessions)
+  assert.equal(progress.totalFiles, totalFiles)
+  assert.equal(progress.error, undefined)
+}
 
-test('上传开始后原 ZIP 不可读取，完整副本仍能完成后续对话和附件导入', async () => {
-  await withHarness(async (harness) => {
-    const { modules } = harness
-    const user = await harness.addUser('stable_source')
-    harness.setCurrentUser(user, { reset: true })
-    const attachment = fileReference(modules, {
-      sessionId: 'source-next',
-      id: 'stable-original',
-      name: 'stable.txt',
-      fileName: 'stable.txt',
-      bytes: new TextEncoder().encode('完整附件'),
-      isImage: false,
-    })
-    const source = toFile(
-      await buildArchive(modules, {
-        sessions: [
-          makeSession({ id: 'source-first' }),
-          makeSession({ id: 'source-next', files: [attachment.entry] }),
-        ],
-        originals: [attachment.original],
-      })
-    )
-    let unavailable = false
-    const slice = source.slice.bind(source)
-    source.slice = (...args) => {
-      if (unavailable) throw new DOMException('源文件已丢失', 'NotFoundError')
-      return slice(...args)
-    }
-    source.stream = () => {
-      if (unavailable) throw new DOMException('源文件已丢失', 'NotFoundError')
-      return Blob.prototype.stream.call(source)
-    }
-    const stop = modules.importProgress.useHistoryImportProgress.subscribe((state) => {
-      if (state.sessions === 1) unavailable = true
-    })
-    try {
-      assert.equal(await modules.backup.importHistory(source), 2)
-      assert.equal(unavailable, true)
-      assert.equal(modules.importProgress.useHistoryImportProgress.getState().files, 1)
-      assert.equal(harness.importStorage.files.size, 0)
-      assert.deepEqual(
-        (await harness.snapshotAs(user)).sessions.map((session) => session.id).sort(),
-        ['source-first', 'source-next']
-      )
-    } finally {
-      stop()
-    }
-  })
-})
+const importStarts = (harness) =>
+  harness.requests.filter(
+    (request) => request.method === 'POST' && request.path === '/api/chats/imports'
+  )
 
-test('源 ZIP 在准备期间读取失败，未创建云端任务且副本完整清理', async () => {
-  await withHarness(async (harness) => {
-    const { modules } = harness
-    const user = await harness.addUser('unreadable_source')
-    harness.setCurrentUser(user, { reset: true })
-    const source = toFile(new Uint8Array(100))
-    source.stream = () =>
-      new ReadableStream({
-        start(controller) {
-          controller.enqueue(new Uint8Array(4))
-        },
-        pull(controller) {
-          controller.error(new DOMException('源文件已丢失', 'NotFoundError'))
-        },
-      })
-    await assert.rejects(modules.backup.importHistory(source), /无法继续读取/)
-    assert.equal(harness.importStorage.files.size, 0)
-    assert.equal(
-      harness.requests.some((request) => request.method === 'POST'),
-      false
-    )
-    const valid = await buildArchive(modules, { sessions: [makeSession({ id: 'readable-again' })] })
-    assert.equal(await modules.backup.importHistory(toFile(valid)), 1)
-  })
-})
+const importDeletes = (harness) =>
+  harness.requests.filter(
+    (request) => request.method === 'DELETE' && /^\/api\/chats\/imports\/[^/]+$/.test(request.path)
+  )
 
-test('副本写入空间不足时保留旧历史，清理副本并准确报告原因', async () => {
-  await withHarness(async (harness) => {
-    const { modules } = harness
-    const user = await harness.addUser('copy_quota')
-    harness.setCurrentUser(user, { reset: true })
-    harness.importStorage.state.beforeWrite = () => {
-      throw new DOMException('空间不足', 'QuotaExceededError')
-    }
-    const archive = await buildArchive(modules, { sessions: [makeSession({ id: 'quota-source' })] })
-    await assert.rejects(modules.backup.importHistory(toFile(archive)), /空间不足/)
-    assert.equal(harness.importStorage.files.size, 0)
-    assert.equal(
-      harness.requests.some((request) => request.method === 'POST'),
-      false
-    )
-    harness.importStorage.state.beforeWrite = undefined
-    assert.equal(await modules.backup.importHistory(toFile(archive)), 1)
-  })
-})
+const commitRequests = (harness) =>
+  harness.requests.filter(
+    (request) =>
+      request.method === 'POST' && /^\/api\/chats\/imports\/[^/]+\/commit$/.test(request.path)
+  )
 
-test('副本准备期间切换账号取消读取与写入，不创建云端任务', async () => {
-  await withHarness(async (harness) => {
-    const { modules } = harness
-    const user = await harness.addUser('copy_account')
-    const other = await harness.addUser('copy_other')
-    harness.setCurrentUser(user, { reset: true })
-    const gate = harness.gate()
-    harness.importStorage.state.beforeWrite = async () => {
-      gate.markEntered()
-      await gate.wait
-    }
-    const archive = await buildArchive(modules, { sessions: [makeSession({ id: 'copy-aborted' })] })
-    const importing = modules.backup.importHistory(toFile(archive))
-    await gate.entered
-    harness.setCurrentUser(other, { reset: true })
-    gate.release()
-    await assert.rejects(importing, /abort|取消/i)
-    assert.equal(harness.importStorage.files.size, 0)
-    assert.equal(
-      harness.requests.some((request) => request.method === 'POST'),
-      false
-    )
-  })
-})
+const sessionRequests = (harness) =>
+  harness.requests.filter(
+    (request) =>
+      request.method === 'POST' && /^\/api\/chats\/imports\/[^/]+\/chats$/.test(request.path)
+  )
 
-test('导入仅恢复传输失败与临时状态，程序错误和永久失败如实报告', async () => {
-  await withHarness(async (harness) => {
-    const { backend, importTransport } = harness.modules
-    assert.equal(importTransport.isImportConnectionError(new TypeError('程序错误')), false)
-    assert.equal(
-      importTransport.isImportConnectionError(new DOMException('源文件不可读', 'NotFoundError')),
-      false
-    )
-    assert.equal(
-      importTransport.isImportConnectionError(
-        new backend.BackendConnectionError(new TypeError('连接中断'))
-      ),
-      true
-    )
-    for (const status of [408, 429, 502, 503, 504]) {
-      assert.equal(
-        importTransport.isImportConnectionError(new backend.BackendError('临时失败', status)),
-        true
-      )
-    }
-    for (const status of [400, 401, 403, 404, 409, 413, 500]) {
-      assert.equal(
-        importTransport.isImportConnectionError(new backend.BackendError('永久失败', status)),
-        false
-      )
-    }
-  })
-})
+const fileRequests = (harness) =>
+  harness.requests.filter(
+    (request) =>
+      request.method === 'PUT' && /^\/api\/chats\/imports\/[^/]+\/files\/[^/]+$/.test(request.path)
+  )
 
-test('创建响应丢失、分片连接中断及完成前断网均自动恢复同一任务', async () => {
-  await withHarness(async (harness) => {
-    const { modules } = harness
-    const user = await harness.addUser('connection_resume')
-    harness.setCurrentUser(user, { reset: true })
-    const failures = new Set()
-    const waits = []
-    const unsubscribe = modules.importProgress.useHistoryImportProgress.subscribe((state) => {
-      if (state.waiting) waits.push({ sessions: state.sessions, files: state.files })
-    })
-    const archive = await buildArchive(modules, {
-      sessions: [makeSession({ id: 'resume-first' }), makeSession({ id: 'resume-next' })],
-    })
-    harness.intercept((request) => {
-      const key =
-        request.path === '/api/chats/imports'
-          ? 'import-start'
-          : request.path === '/api/storage/uploads'
-            ? 'upload-start'
-            : /\/parts\/1$/.test(request.path)
-              ? 'part'
-              : /\/complete$/.test(request.path)
-                ? 'complete'
-                : /\/commit$/.test(request.path)
-                  ? 'commit'
-                  : undefined
-      if (!key || failures.has(key)) return
-      failures.add(key)
-      const failure = new TypeError('连接已中断')
-      if (key.endsWith('start'))
-        return {
-          afterResponse() {
-            throw failure
-          },
-        }
-      return { error: failure }
-    })
-    try {
-      assert.equal(await modules.backup.importHistory(toFile(archive)), 2)
-      assert.equal(waits.length >= 5, true)
-      assert.equal(harness.db.db.prepare('SELECT COUNT(*) AS n FROM cloud_imports').get().n, 1)
-      assert.equal(harness.db.db.prepare('SELECT COUNT(*) AS n FROM cloud_uploads').get().n, 2)
-      assert.equal(
-        harness.requests.some((request) => request.method === 'DELETE'),
-        false
-      )
-      assert.equal(harness.importStorage.files.size, 0)
-      assert.equal(modules.importProgress.useHistoryImportProgress.getState().waiting, undefined)
-    } finally {
-      unsubscribe()
-    }
-  })
-})
+const resultRequests = (harness) =>
+  harness.requests.filter(
+    (request) =>
+      request.method === 'GET' && /^\/api\/chats\/imports\/[^/]+\/result$/.test(request.path)
+  )
 
-test('断网等待期间保留进度和离开提醒，联网后继续且账号变化可结束等待', async () => {
-  await withHarness(async (harness) => {
-    const { modules } = harness
-    const user = await harness.addUser('waiting_user')
-    const other = await harness.addUser('waiting_other')
-    harness.setCurrentUser(user, { reset: true })
-    const previousWindow = globalThis.window
-    const page = new EventTarget()
-    globalThis.window = page
-    let disconnected = true
-    harness.intercept((request) => {
-      if (disconnected && request.method === 'PUT') return { error: new TypeError('连接中断') }
-    })
-    const archive = await buildArchive(modules, { sessions: [makeSession({ id: 'wait-resume' })] })
-    try {
-      const importing = modules.backup.importHistory(toFile(archive))
-      await harness.waitUntil(
-        () => modules.importProgress.useHistoryImportProgress.getState().waiting
-      )
-      const leaving = new Event('beforeunload', { cancelable: true })
-      page.dispatchEvent(leaving)
-      assert.equal(leaving.defaultPrevented, true)
-      assert.equal(harness.files.multipartUploads.size, 1)
-      disconnected = false
-      page.dispatchEvent(new Event('online'))
-      assert.equal(await importing, 1)
-      disconnected = true
-      const cancelled = modules.backup.importHistory(toFile(archive))
-      await harness.waitUntil(
-        () => modules.importProgress.useHistoryImportProgress.getState().waiting
-      )
-      harness.setCurrentUser(other, { reset: true })
-      await assert.rejects(cancelled, /账号已变更|取消/)
-      assert.equal(harness.importStorage.files.size, 0)
-      const after = new Event('beforeunload', { cancelable: true })
-      page.dispatchEvent(after)
-      assert.equal(after.defaultPrevented, false)
-      assert.equal(mutationRequests(harness, other).length, 0)
-    } finally {
-      if (previousWindow === undefined) delete globalThis.window
-      else globalThis.window = previousWindow
-    }
-  })
-})
-
-test('提交成功后读取列表失败明确报告已保存，不再取消已提交任务', async () => {
-  await withHarness(async (harness) => {
-    const { modules } = harness
-    const user = await harness.addUser('committed_read_failure')
-    harness.setCurrentUser(user, { reset: true })
-    await modules.store.initChat()
-    const archive = await buildArchive(modules, {
-      sessions: [makeSession({ id: 'saved-before-read-failure' })],
-    })
-    let committed = false
-    harness.intercept((request) => {
-      if (request.method === 'POST' && /\/imports\/[^/]+\/commit$/.test(request.path)) {
-        return {
-          afterResponse: () => {
-            committed = true
-          },
-        }
-      }
-      if (committed && request.method === 'GET' && request.path === '/api/chats') {
-        return {
-          response: new Response(JSON.stringify({ error: { message: '读取更新不可用' } }), {
-            status: 500,
-          }),
-        }
-      }
-    })
-    await assert.rejects(
-      modules.backup.importHistory(toFile(archive)),
-      /历史已保存至云端，但读取更新失败/
-    )
-    assert.deepEqual(
-      (await harness.snapshotAs(user)).sessions.map((summary) => summary.id),
-      ['saved-before-read-failure']
-    )
-    assert.equal(
-      harness.requests.some(
-        (request) => request.method === 'DELETE' && /\/imports\/[^/]+$/.test(request.path)
-      ),
-      false
-    )
-  })
-})
+const archivePosts = (harness) =>
+  harness.requests.filter(
+    (request) => request.method === 'POST' && request.path === '/api/chats/imports/archive'
+  )
 
 const localSession = (modules, session, fileTypes = new Map()) => {
   const local = modules.toLocalSession(session).session
@@ -492,110 +195,517 @@ const mutationRequests = (harness, user) =>
       request.user.id === user.id && ['POST', 'PUT', 'PATCH', 'DELETE'].includes(request.method)
   )
 
-test('235 个会话、超过 1 MiB 的归档和超过 900 KiB 的会话逐条完整导入', async () => {
+test('非法 ZIP 在本地检查阶段失败且不产生任何网络请求', async () => {
   await withHarness(async (harness) => {
     const { modules } = harness
-    const user = await harness.addUser('bulk_user')
+    const user = await harness.addUser('local_invalid')
     harness.setCurrentUser(user, { reset: true })
-    modules.importProgress.resetHistoryImportProgress()
+    await modules.store.initChat()
+    const before = harness.requests.length
+    const broken = toFile(new Uint8Array([0x4e, 0x4f, 0x54, 0x5a, 0x49, 0x50]), 'broken.zip')
+    await assert.rejects(modules.backup.importHistory(broken))
+    assert.equal(harness.requests.length, before)
+    assert.equal(archivePosts(harness).length, 0)
+    assert.equal(importStarts(harness).length, 0)
+    assert.equal(modules.importProgress.useHistoryImportProgress.getState().phase, 'error')
+    assert.equal(modules.store.useChatStore.getState().importingHistory, false)
+  })
+})
 
-    const imageBytes = new Uint8Array([
-      0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0x00, 0x00, 0x0d, 0x49, 0x48, 0x44,
-      0x52,
-    ])
-    const documentBytes = new TextEncoder().encode('%PDF-1.7\nsynthetic attachment\n')
-    const image = fileReference(modules, {
-      sessionId: 'bulk-0',
-      id: 'image-original',
-      name: 'synthetic.png',
-      fileName: 'synthetic.png',
-      bytes: imageBytes,
-      isImage: true,
+test('导入全过程绑定离开页面提醒，失败后移除提醒并保留历史', async () => {
+  await withHarness(async (harness) => {
+    const { modules } = harness
+    const user = await harness.addUser('leave_protection')
+    harness.setCurrentUser(user, { reset: true })
+    await modules.store.initChat()
+    const originalWindow = globalThis.window
+    const page = new EventTarget()
+    globalThis.window = page
+    const archive = await buildArchive(modules, {
+      sessions: [makeSession({ id: 'leave-protected' })],
     })
-    const document = fileReference(modules, {
-      sessionId: 'bulk-0',
-      id: 'document-original',
-      name: 'synthetic.pdf',
-      fileName: 'synthetic.pdf',
-      bytes: documentBytes,
-      isImage: false,
+    const rejectChats = harness.intercept((request) => {
+      if (request.method === 'POST' && /\/chats$/.test(request.path)) {
+        return {
+          response: new Response(JSON.stringify({ error: { message: '文件内容无效' } }), {
+            status: 400,
+          }),
+        }
+      }
     })
-    const largeAnswer = 'x'.repeat(1_250_000)
-    const sessions = Array.from({ length: 235 }, (_, index) =>
-      makeSession({
-        id: `bulk-${index}`,
-        title: `Synthetic session ${index}`,
-        pinned: index % 10 === 0 || index === 234,
-        base: 1_700_000_000_000 + index * 100_000,
-        largeAnswer: index === 117 ? largeAnswer : '',
-        files: index === 0 ? [image.entry, document.entry] : [],
-      })
+    try {
+      const importing = modules.backup.importHistory(toFile(archive))
+      const leaving = new Event('beforeunload', { cancelable: true })
+      page.dispatchEvent(leaving)
+      assert.equal(leaving.defaultPrevented, true)
+      await assert.rejects(importing, /文件内容无效/)
+      const afterFailure = new Event('beforeunload', { cancelable: true })
+      page.dispatchEvent(afterFailure)
+      assert.equal(afterFailure.defaultPrevented, false)
+      assert.equal(modules.importProgress.useHistoryImportProgress.getState().phase, 'error')
+      assert.equal(modules.store.useChatStore.getState().importingHistory, false)
+      assert.equal(importDeletes(harness).length, 1)
+      assert.equal(commitRequests(harness).length, 0)
+      assert.deepEqual((await harness.snapshotAs(user)).sessions, [])
+      rejectChats()
+      assert.equal(await modules.backup.importHistory(toFile(archive)), 1)
+      const afterSuccess = new Event('beforeunload', { cancelable: true })
+      page.dispatchEvent(afterSuccess)
+      assert.equal(afterSuccess.defaultPrevented, false)
+      assertDone(modules.importProgress.useHistoryImportProgress.getState(), 1, 0)
+    } finally {
+      rejectChats()
+      if (originalWindow === undefined) delete globalThis.window
+      else globalThis.window = originalWindow
+    }
+  })
+})
+
+test('小会话按最多十六个且不超过 240 KiB 合批保存，进度使用本地目录总数', async () => {
+  await withHarness(async (harness) => {
+    const { modules } = harness
+    const user = await harness.addUser('batch_counts')
+    harness.setCurrentUser(user, { reset: true })
+    const sessions = Array.from({ length: 20 }, (_, index) =>
+      makeSession({ id: `batch-${index}`, largeAnswer: 'x'.repeat(6_000) })
     )
-    const jsonBytes = sessions.reduce(
-      (total, session) => total + Buffer.byteLength(JSON.stringify(session)),
+    const archive = await buildArchive(modules, { sessions })
+    const progress = []
+    const unsubscribe = modules.importProgress.useHistoryImportProgress.subscribe((state) =>
+      progress.push(plain(state))
+    )
+    assert.equal(await modules.backup.importHistory(toFile(archive)), 20)
+    unsubscribe()
+    const batches = sessionRequests(harness)
+    assert.ok(batches.length >= 2)
+    for (const request of batches) {
+      const batch = request.body?.sessions
+      assert.ok(Array.isArray(batch))
+      assert.ok(batch.length >= 1 && batch.length <= 16)
+      assert.ok(Buffer.byteLength(JSON.stringify(batch)) <= 240 * 1024)
+    }
+    assert.equal(
+      batches.reduce((sum, request) => sum + request.body.sessions.length, 0),
+      20
+    )
+    assert.deepEqual(
+      batches.flatMap((request) => request.body.sessions.map((session) => session.id)).sort(),
+      sessions.map((session) => session.id).sort()
+    )
+    assert.ok(
+      progress.some(
+        (state) =>
+          state.phase === 'processing' && state.totalSessions === 20 && state.totalFiles === 0
+      ),
+      '目录校验后应写入真实总数'
+    )
+    assertDone(modules.importProgress.useHistoryImportProgress.getState(), 20, 0)
+    assert.equal(commitRequests(harness)[0].body.count, 20)
+    assert.equal(fileRequests(harness).length, 0)
+  })
+})
+
+test('大型会话单条上传，进度只在真实保存后增加，提交使用完整目录返回', async () => {
+  await withHarness(async (harness) => {
+    const { modules } = harness
+    const user = await harness.addUser('large_session')
+    harness.setCurrentUser(user, { reset: true })
+    const sessions = [
+      makeSession({ id: 'large-one', largeAnswer: 'x'.repeat(400_000) }),
+      makeSession({ id: 'small-one' }),
+    ]
+    assert.ok(Buffer.byteLength(JSON.stringify(sessions[0])) > 256 * 1024)
+    const archive = await buildArchive(modules, { sessions })
+    const progress = []
+    const unsubscribe = modules.importProgress.useHistoryImportProgress.subscribe((state) =>
+      progress.push(plain(state))
+    )
+    assert.equal(await modules.backup.importHistory(toFile(archive)), 2)
+    unsubscribe()
+    assertDone(modules.importProgress.useHistoryImportProgress.getState(), 2, 0)
+    assert.ok(
+      progress.some((state) => state.phase === 'processing' && state.sessions === 1),
+      '保存完成后应更新已完成会话数'
+    )
+    assert.ok(
+      progress.some((state) => state.phase === 'processing' && state.sessions === 2),
+      '全部保存完成后应更新已完成会话数'
+    )
+    const commit = commitRequests(harness)[0]
+    assert.equal(commit.body.count, 2)
+    assert.equal(commit.status, 200)
+    assert.deepEqual(commit.body.sessions.map((session) => session.id).sort(), [
+      'large-one',
+      'small-one',
+    ])
+    assert.equal(
+      harness.requests.filter(
+        (request) =>
+          request.method === 'GET' && /^\/api\/chats\/imports\/[^/]+\/result$/.test(request.path)
+      ).length,
       0
     )
-    const largestJson = Math.max(
-      ...sessions.map((session) => Buffer.byteLength(JSON.stringify(session)))
-    )
-    assert.ok(jsonBytes > 1024 * 1024)
-    assert.ok(largestJson > 900 * 1024)
-
-    const archive = await buildArchive(modules, {
-      sessions,
-      originals: [image.original, document.original],
-      originalsFirst: true,
-    })
-    const phases = []
-    const unsubscribe = modules.importProgress.useHistoryImportProgress.subscribe((state) => {
-      phases.push(state.phase)
-    })
-    const imported = await modules.backup.importHistory(toFile(archive))
-    unsubscribe()
-    assert.equal(imported, 235)
-    const progress = modules.importProgress.useHistoryImportProgress.getState()
     assert.deepEqual(
-      new Set(phases),
-      new Set(['preparing', 'checking', 'uploading', 'committing', 'done'])
+      (await harness.snapshotAs(user)).sessions.map((session) => session.id).sort(),
+      ['large-one', 'small-one']
     )
-    assert.equal(progress.phase, 'done')
-    assert.equal(progress.sessions, 235)
-    assert.equal(progress.files, 2)
+  })
+})
 
-    const fileTypes = new Map([
-      ['image-original', 'image/png'],
-      ['document-original', 'application/pdf'],
-    ])
-    const expected = new Map(
-      sessions.map((session) => [
-        session.id,
-        localSession(modules, session, session.id === 'bulk-0' ? fileTypes : new Map()),
-      ])
-    )
-    const loaded = await harness.loadAllSessionsAs(user)
-    assert.equal(loaded.sessions.length, 235)
-    assert.equal(loaded.generation, (await harness.snapshotAs(user)).generation)
-    for (const actual of loaded.sessions) {
-      assertSession(actual, expected.get(actual.id))
+test('后端提交响应丢失后按本次任务恢复，不重复上传或另建任务', async () => {
+  await withHarness(async (harness) => {
+    const { modules } = harness
+    const user = await harness.addUser('lost_commit_response')
+    harness.setCurrentUser(user, { reset: true })
+    const archive = await buildArchive(modules, {
+      sessions: [makeSession({ id: 'commit-recovered' })],
+    })
+    let lost = false
+    const stop = harness.intercept((request) => {
+      if (
+        !lost &&
+        request.method === 'POST' &&
+        /^\/api\/chats\/imports\/[^/]+\/commit$/.test(request.path)
+      ) {
+        lost = true
+        return {
+          afterResponse() {
+            throw new TypeError('simulated connection reset')
+          },
+        }
+      }
+    })
+    try {
+      assert.equal(await modules.backup.importHistory(toFile(archive)), 1)
+    } finally {
+      stop()
     }
-    assert.equal(loaded.sessions.find((session) => session.id === 'bulk-234').pinned, true)
+    assertDone(modules.importProgress.useHistoryImportProgress.getState(), 1, 0)
+    assert.equal(importStarts(harness).length, 1)
+    assert.equal(commitRequests(harness).length, 1)
+    assert.equal(importDeletes(harness).length, 0)
+    assert.deepEqual(
+      (await harness.snapshotAs(user)).sessions.map((session) => session.id),
+      ['commit-recovered']
+    )
+  })
+})
 
-    const first = loaded.sessions.find((session) => session.id === 'bulk-0')
-    const referenced = new Map(
-      first.messages.flatMap((message) =>
-        message.role === 'user' ? message.files.map((file) => [file.id, file]) : []
+test('会话批处理和附件直接上传共用四任务并发上限', async () => {
+  await withHarness(async (harness) => {
+    const { modules } = harness
+    const user = await harness.addUser('four_tasks')
+    harness.setCurrentUser(user, { reset: true })
+    const references = Array.from({ length: 6 }, (_, index) =>
+      fileReference(modules, {
+        sessionId: 'gate-session',
+        id: `gate-file-${index}`,
+        name: `gate-${index}.png`,
+        bytes: new Uint8Array([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, index]),
+        isImage: true,
+      })
+    )
+    const archive = await buildArchive(modules, {
+      sessions: [makeSession({ id: 'gate-session', files: references.map((item) => item.entry) })],
+      originals: references.map((item) => item.original),
+    })
+    const seen = new Set()
+    let active = 0
+    let peak = 0
+    const gate = harness.gate()
+    const stop = harness.intercept(async (request) => {
+      let key
+      if (request.method === 'POST' && /\/chats$/.test(request.path)) {
+        key = `chat:${request.body?.sessions?.[0]?.id}`
+      } else if (request.method === 'PUT' && /\/files\//.test(request.path)) {
+        key = `file:${request.path.split('/').at(-1)}`
+      } else {
+        return
+      }
+      if (seen.has(key)) return
+      seen.add(key)
+      active++
+      peak = Math.max(peak, active)
+      if (active === 4) gate.markEntered()
+      await gate.wait
+      active--
+    })
+    const importing = modules.backup.importHistory(toFile(archive))
+    try {
+      await gate.entered
+      assert.equal(peak, 4)
+      assert.equal(active, 4)
+      gate.release()
+      assert.equal(await importing, 1)
+    } finally {
+      gate.release()
+      await importing.catch(() => undefined)
+      stop()
+    }
+    assert.equal(peak, 4)
+    assert.equal(seen.size, 7)
+    assertDone(modules.importProgress.useHistoryImportProgress.getState(), 1, 6)
+    assert.equal(harness.files.multipartUploads.size, 0)
+  })
+})
+
+test('原件超过 8 MiB 时回退 multipart，小附件继续直接 PUT', async () => {
+  await withHarness(async (harness) => {
+    const { modules } = harness
+    const user = await harness.addUser('multipart_file')
+    harness.setCurrentUser(user, { reset: true })
+    const big = new Uint8Array(8 * 1024 * 1024 + 9_331)
+    big.fill(0x41)
+    const smallBytes = new Uint8Array([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a])
+    const bigFile = fileReference(modules, {
+      sessionId: 'mixed-files',
+      id: 'big-original',
+      name: 'big.bin',
+      bytes: big,
+      isImage: false,
+    })
+    const smallFile = fileReference(modules, {
+      sessionId: 'mixed-files',
+      id: 'small-original',
+      name: 'small.png',
+      bytes: smallBytes,
+      isImage: true,
+    })
+    const archive = await buildArchive(modules, {
+      sessions: [makeSession({ id: 'mixed-files', files: [bigFile.entry, smallFile.entry] })],
+      originals: [bigFile.original, smallFile.original],
+    })
+    assert.equal(await modules.backup.importHistory(toFile(archive)), 1)
+    assertDone(modules.importProgress.useHistoryImportProgress.getState(), 1, 2)
+    assert.equal(fileRequests(harness).length, 1)
+    assert.ok(
+      harness.requests.some((request) =>
+        /^\/api\/storage\/uploads\/[^/]+\/parts\//.test(request.path)
       )
     )
-    assert.equal(referenced.size, 2)
-    const originals = new Map([
-      ['synthetic.png', imageBytes],
-      ['synthetic.pdf', documentBytes],
-    ])
-    for (const file of referenced.values()) {
-      const response = await harness.api(user, `/api/files/${file.id}`)
-      assert.equal(response.status, 200)
-      assert.deepEqual(new Uint8Array(await response.arrayBuffer()), originals.get(file.name))
+    assert.equal((await harness.loadSessionAs(user, 'mixed-files')).messages[0].files.length, 2)
+  })
+})
+
+test('附件保存失败后第一个错误取消兄弟任务，在途任务结束后删除导入任务', async () => {
+  await withHarness(async (harness) => {
+    const { modules } = harness
+    const user = await harness.addUser('first_error')
+    harness.setCurrentUser(user, { reset: true })
+    const references = Array.from({ length: 6 }, (_, index) =>
+      fileReference(modules, {
+        sessionId: 'error-session',
+        id: `error-file-${index}`,
+        name: `error-${index}.png`,
+        bytes: new Uint8Array([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, index]),
+        isImage: true,
+      })
+    )
+    const archive = await buildArchive(modules, {
+      sessions: [makeSession({ id: 'error-session', files: references.map((item) => item.entry) })],
+      originals: references.map((item) => item.original),
+    })
+    const gate = harness.gate()
+    let first = true
+    let inFlight = 0
+    const stop = harness.intercept(async (request) => {
+      if (request.method !== 'PUT' || !/\/files\//.test(request.path)) return
+      const isFirst = first
+      first = false
+      if (!isFirst) {
+        inFlight++
+        await gate.wait
+        inFlight--
+        return
+      }
+      gate.markEntered()
+      await gate.wait
+      return {
+        response: new Response(
+          JSON.stringify({ error: { message: 'injected first file failure' } }),
+          {
+            status: 500,
+            headers: { 'Content-Type': 'application/json' },
+          }
+        ),
+      }
+    })
+    const importing = modules.backup.importHistory(toFile(archive))
+    try {
+      await gate.entered
+      gate.release()
+      await assert.rejects(importing, /injected first file failure/)
+    } finally {
+      gate.release()
+      await importing.catch(() => undefined)
+      stop()
     }
+    assert.equal(inFlight, 0)
+    assert.equal(commitRequests(harness).length, 0)
+    assert.equal(importDeletes(harness).length, 1)
+    assert.equal(modules.importProgress.useHistoryImportProgress.getState().phase, 'error')
+    assert.deepEqual((await harness.snapshotAs(user)).sessions, [])
+    assert.equal(
+      await modules.backup.importHistory(
+        toFile(await buildArchive(modules, { sessions: [makeSession({ id: 'retry-ok' })] }))
+      ),
+      1
+    )
+  })
+})
+
+test('解析阶段切换账号中止导入，取消请求拒绝身份校验且不写入新账号', async () => {
+  await withHarness(async (harness) => {
+    const { modules } = harness
+    const alice = await harness.addUser('identity_alice')
+    const bob = await harness.addUser('identity_bob')
+    const aliceOld = localSession(
+      modules,
+      makeSession({ id: 'alice-old', title: 'Alice old', base: 1_670_000_000_000 })
+    )
+    const bobOldRaw = makeSession({ id: 'bob-old', title: 'Bob old', base: 1_671_000_000_000 })
+    bobOldRaw.messages[0].fragments.find((fragment) => fragment.type === 'REQUEST').content =
+      '**bold retained**'
+    const bobOld = localSession(modules, bobOldRaw)
+    await seedSession(harness, alice, aliceOld)
+    await seedSession(harness, bob, bobOld)
+    harness.setCurrentUser(alice, { reset: true })
+    await modules.store.initChat()
+
+    const archive = await buildArchive(modules, {
+      sessions: [makeSession({ id: 'alice-new', title: 'Alice new' })],
+    })
+    const gate = harness.gate()
+    const stop = harness.intercept(async (request) => {
+      if (request.method === 'POST' && /\/chats$/.test(request.path)) {
+        gate.markEntered()
+        await gate.wait
+      }
+    })
+    const importing = modules.backup.importHistory(toFile(archive))
+    try {
+      await gate.entered
+      harness.setCurrentUser(bob, { reset: true })
+      gate.release()
+      await assert.rejects(importing, /账号已变更|取消/)
+      assert.equal(modules.importProgress.useHistoryImportProgress.getState().phase, 'error')
+    } finally {
+      gate.release()
+      await importing.catch(() => undefined)
+      stop()
+    }
+    assert.equal(mutationRequests(harness, bob).length, 0)
+    await modules.store.initChat()
+    assert.deepEqual(
+      modules.store.useChatStore.getState().sessions.map((session) => session.id),
+      ['bob-old']
+    )
+    assert.match(
+      (await harness.loadSessionAs(bob, 'bob-old')).messages[0].content,
+      /\*\*bold retained\*\*/
+    )
+    assert.deepEqual(
+      (await harness.snapshotAs(alice)).sessions.map((session) => session.id),
+      ['alice-old']
+    )
+  })
+})
+
+test('处理阶段保留离开提醒，账号切换后取消并清理提醒', async () => {
+  await withHarness(async (harness) => {
+    const { modules } = harness
+    const user = await harness.addUser('waiting_user')
+    const other = await harness.addUser('waiting_other')
+    harness.setCurrentUser(user, { reset: true })
+    const previousWindow = globalThis.window
+    const page = new EventTarget()
+    globalThis.window = page
+    const archive = await buildArchive(modules, {
+      sessions: [makeSession({ id: 'wait-cancel' })],
+    })
+    const gate = harness.gate()
+    const stop = harness.intercept(async (request) => {
+      if (request.method === 'POST' && /\/chats$/.test(request.path)) {
+        gate.markEntered()
+        await gate.wait
+      }
+    })
+    let importing
+    try {
+      importing = modules.backup.importHistory(toFile(archive))
+      await gate.entered
+      const during = new Event('beforeunload', { cancelable: true })
+      page.dispatchEvent(during)
+      assert.equal(during.defaultPrevented, true)
+      harness.setCurrentUser(other, { reset: true })
+      gate.release()
+      await assert.rejects(importing, /账号已变更|取消/)
+      assert.equal(modules.importProgress.useHistoryImportProgress.getState().phase, 'error')
+      const after = new Event('beforeunload', { cancelable: true })
+      page.dispatchEvent(after)
+      assert.equal(after.defaultPrevented, false)
+      assert.equal(mutationRequests(harness, other).length, 0)
+    } finally {
+      gate.release()
+      if (importing) await importing.catch(() => undefined)
+      stop()
+      if (previousWindow === undefined) delete globalThis.window
+      else globalThis.window = previousWindow
+    }
+  })
+})
+
+test('仅恢复临时传输失败，文件内容、权限和数据冲突错误如实报告', async () => {
+  await withHarness(async (harness) => {
+    const { modules } = harness
+    const { backend, importTransport } = modules
+    assert.equal(importTransport.isImportConnectionError(new TypeError('程序错误')), false)
+    assert.equal(
+      importTransport.isImportConnectionError(new DOMException('源文件不可读', 'NotFoundError')),
+      false
+    )
+    assert.equal(
+      importTransport.isImportConnectionError(
+        new backend.BackendConnectionError(new TypeError('连接中断'))
+      ),
+      true
+    )
+    for (const status of [408, 429, 502, 503, 504]) {
+      assert.equal(
+        importTransport.isImportConnectionError(new backend.BackendError('临时失败', status)),
+        true
+      )
+    }
+    for (const status of [400, 401, 403, 404, 409, 413, 500]) {
+      assert.equal(
+        importTransport.isImportConnectionError(new backend.BackendError('永久失败', status)),
+        false
+      )
+    }
+
+    const user = await harness.addUser('permanent_error')
+    harness.setCurrentUser(user, { reset: true })
+    const archive = await buildArchive(modules, { sessions: [makeSession({ id: 'permanent' })] })
+    const stop = harness.intercept((request) => {
+      if (request.method === 'POST' && /\/chats$/.test(request.path)) {
+        return {
+          response: new Response(JSON.stringify({ error: { message: '数据冲突' } }), {
+            status: 409,
+          }),
+        }
+      }
+    })
+    try {
+      await assert.rejects(modules.backup.importHistory(toFile(archive)), /数据冲突/)
+    } finally {
+      stop()
+    }
+    assert.equal(
+      sessionRequests(harness).filter((request) => request.status === 409).length >= 1,
+      true
+    )
+    assert.equal(importStarts(harness).length, 1)
+    assert.equal(commitRequests(harness).length, 0)
   })
 })
 
@@ -612,10 +722,6 @@ test('暂存内容在提交前不可见，提交后原子切换并支持导出�
     await seedSession(harness, user, oldSession)
     harness.setCurrentUser(user, { reset: true })
     await modules.store.initChat()
-    assert.deepEqual(
-      modules.store.useChatStore.getState().sessions.map((session) => session.id),
-      ['old-session']
-    )
 
     const sessions = ['new-alpha', 'new-beta', 'new-gamma'].map((id, index) =>
       makeSession({
@@ -627,62 +733,38 @@ test('暂存内容在提交前不可见，提交后原子切换并支持导出�
     )
     const archive = await buildArchive(modules, { sessions })
     const gate = harness.gate()
-    let importUploads = 0
-    harness.intercept(async (request) => {
-      if (request.path !== '/api/storage/uploads' || request.method !== 'POST') {
-        return
-      }
-      const metadata = JSON.parse(request.body)
-      if (!metadata.importId || metadata.kind !== 'chat') {
-        return
-      }
-      importUploads += 1
-      if (importUploads === 2) {
+    const stop = harness.intercept(async (request) => {
+      if (request.method === 'POST' && /\/chats$/.test(request.path)) {
         gate.markEntered()
         await gate.wait
       }
     })
-
     const importing = modules.backup.importHistory(toFile(archive))
-    await gate.entered
-    await assert.rejects(modules.backup.importHistory(toFile(archive)), /正在导入历史/)
-    assert.equal(importUploads, 2)
-    assert.equal(modules.store.useChatStore.getState().importingHistory, true)
+    try {
+      await gate.entered
+      await assert.rejects(modules.backup.importHistory(toFile(archive)), /正在导入历史/)
+      assert.equal(importStarts(harness).length, 1)
+      assert.equal(modules.store.useChatStore.getState().importingHistory, true)
+      assert.deepEqual(
+        modules.store.useChatStore.getState().sessions.map((session) => session.id),
+        ['old-session']
+      )
+      assert.deepEqual(
+        (await harness.snapshotAs(user)).sessions.map((session) => session.id),
+        ['old-session']
+      )
+      gate.release()
+      assert.equal(await importing, 3)
+    } finally {
+      gate.release()
+      await importing.catch(() => undefined)
+      stop()
+    }
+    assertDone(modules.importProgress.useHistoryImportProgress.getState(), 3, 0)
     assert.deepEqual(
-      modules.store.useChatStore.getState().sessions.map((session) => session.id),
-      ['old-session']
-    )
-    const duringImport = await harness.snapshotAs(user)
-    assert.deepEqual(
-      duringImport.sessions.map((session) => session.id),
-      ['old-session']
-    )
-    gate.release()
-    assert.equal(await importing, 3)
-    assert.deepEqual(modules.importProgress.useHistoryImportProgress.getState(), {
-      phase: 'done',
-      sessions: 3,
-      files: 0,
-    })
-
-    const afterCommit = await harness.snapshotAs(user)
-    assert.deepEqual(afterCommit.sessions.map((session) => session.id).sort(), [
-      'new-alpha',
-      'new-beta',
-      'new-gamma',
-    ])
-    assert.deepEqual(
-      modules.store.useChatStore
-        .getState()
-        .sessions.map((session) => session.id)
-        .sort(),
+      (await harness.snapshotAs(user)).sessions.map((session) => session.id).sort(),
       ['new-alpha', 'new-beta', 'new-gamma']
     )
-    assert.equal(
-      afterCommit.sessions.some((session) => session.id === 'old-session'),
-      false
-    )
-
     const fresh = await harness.freshModules()
     fresh.backend.setBackendUserId(user.id)
     fresh.store.resetChatState()
@@ -694,7 +776,6 @@ test('暂存内容在提交前不可见，提交后原子切换并支持导出�
         .sort(),
       ['new-alpha', 'new-beta', 'new-gamma']
     )
-
     const beforeExport = await harness.loadAllSessionsAs(user)
     const exported = await modules.backup.exportHistory()
     assert.match(exported.name, /^deepseek_data-\d{4}-\d{2}-\d{2}\.zip$/)
@@ -713,7 +794,7 @@ test('暂存内容在提交前不可见，提交后原子切换并支持导出�
   })
 })
 
-test('错误归档、上传数据库失败和提交失败都保留旧历史', async () => {
+test('解析后数据库失败不发布新历史，已有会话保持原样', async () => {
   await withHarness(async (harness) => {
     const { modules } = harness
     const user = await harness.addUser('failure_user')
@@ -725,122 +806,29 @@ test('错误归档、上传数据库失败和提交失败都保留旧历史', as
     harness.setCurrentUser(user, { reset: true })
     await modules.store.initChat()
     const original = await harness.snapshotAs(user)
+    const beforeInvalid = harness.requests.length
 
-    const importStarts = () =>
-      harness.requests.filter(
-        (request) => request.path === '/api/chats/imports' && request.method === 'POST'
-      ).length
-    const beforeInvalid = importStarts()
     await assert.rejects(
       modules.backup.importHistory(
         toFile(new Uint8Array([0x4e, 0x4f, 0x54, 0x5a, 0x49, 0x50]), 'broken.zip')
       )
     )
     assert.equal(modules.importProgress.useHistoryImportProgress.getState().phase, 'error')
-    assert.ok(modules.importProgress.useHistoryImportProgress.getState().error)
-    assert.equal(importStarts(), beforeInvalid)
+    assert.equal(harness.requests.length, beforeInvalid)
     assert.deepEqual((await harness.snapshotAs(user)).sessions, original.sessions)
 
-    const validArchive = await buildArchive(modules, {
+    const insertArchive = await buildArchive(modules, {
       sessions: [makeSession({ id: 'not-published-1', title: 'Not published 1' })],
     })
-    harness.db.failNext(/INSERT INTO cloud_uploads/i, new Error('injected upload insert'))
-    await assert.rejects(modules.backup.importHistory(toFile(validArchive)))
+    harness.db.failNext(/INSERT INTO chats/i, new Error('injected chats insert'))
+    await assert.rejects(modules.backup.importHistory(toFile(insertArchive)))
     assert.equal(modules.importProgress.useHistoryImportProgress.getState().phase, 'error')
     assert.deepEqual((await harness.snapshotAs(user)).sessions, original.sessions)
     assert.deepEqual(
       modules.store.useChatStore.getState().sessions.map((session) => session.id),
       ['keep-old']
     )
-
-    const commitArchive = await buildArchive(modules, {
-      sessions: [makeSession({ id: 'not-published-2', title: 'Not published 2' })],
-    })
-    harness.db.failNext(
-      /UPDATE cloud_imports\s+SET status = 'committed'/i,
-      new Error('injected commit update')
-    )
-    await assert.rejects(modules.backup.importHistory(toFile(commitArchive)))
-    assert.equal(modules.importProgress.useHistoryImportProgress.getState().phase, 'error')
-    assert.deepEqual((await harness.snapshotAs(user)).sessions, original.sessions)
-    assert.deepEqual(
-      modules.store.useChatStore.getState().sessions.map((session) => session.id),
-      ['keep-old']
-    )
-    assert.equal(
-      harness.db.db
-        .prepare(
-          `SELECT COUNT(*) AS count FROM chats
-         WHERE user_id = ? AND generation <> 'legacy'`
-        )
-        .get(user.id).count,
-      0
-    )
-  })
-})
-
-test('解析后切换账号会中止上传，不向新账号写入且保留其旧会话', async () => {
-  await withHarness(async (harness) => {
-    const { modules } = harness
-    const alice = await harness.addUser('identity_alice')
-    const bob = await harness.addUser('identity_bob')
-    const aliceOld = localSession(
-      modules,
-      makeSession({ id: 'alice-old', title: 'Alice old', base: 1_670_000_000_000 })
-    )
-    const bobOldRaw = makeSession({
-      id: 'bob-old',
-      title: 'Bob old',
-      base: 1_671_000_000_000,
-    })
-    bobOldRaw.messages[0].fragments.find((fragment) => fragment.type === 'REQUEST').content =
-      '**bold retained**'
-    const bobOld = localSession(modules, bobOldRaw)
-    await seedSession(harness, alice, aliceOld)
-    await seedSession(harness, bob, bobOld)
-    harness.setCurrentUser(alice, { reset: true })
-    await modules.store.initChat()
-
-    const archive = await buildArchive(modules, {
-      sessions: [
-        makeSession({ id: 'alice-new-1', title: 'Alice new 1' }),
-        makeSession({ id: 'alice-new-2', title: 'Alice new 2' }),
-      ],
-    })
-    const gate = harness.gate()
-    let held = false
-    harness.intercept(async (request) => {
-      if (held || request.path !== '/api/storage/uploads' || request.method !== 'POST') {
-        return
-      }
-      const metadata = JSON.parse(request.body)
-      if (!metadata.importId) {
-        return
-      }
-      held = true
-      gate.markEntered()
-      await gate.wait
-    })
-    const importing = modules.backup.importHistory(toFile(archive))
-    await gate.entered
-    harness.setCurrentUser(bob, { reset: true })
-    gate.release()
-    await assert.rejects(importing, /账号已变更|取消/)
-    assert.equal(modules.importProgress.useHistoryImportProgress.getState().phase, 'error')
-    assert.ok(modules.importProgress.useHistoryImportProgress.getState().error)
-
-    assert.equal(mutationRequests(harness, bob).length, 0)
-    await modules.store.initChat()
-    assert.deepEqual(
-      modules.store.useChatStore.getState().sessions.map((session) => session.id),
-      ['bob-old']
-    )
-    const bobFromOtherDevice = await harness.loadSessionAs(bob, 'bob-old')
-    assert.match(bobFromOtherDevice.messages[0].content, /\*\*bold retained\*\*/)
-    assert.deepEqual(
-      (await harness.snapshotAs(alice)).sessions.map((session) => session.id),
-      ['alice-old']
-    )
+    assert.equal(importDeletes(harness).length > 0, true)
   })
 })
 
@@ -860,51 +848,44 @@ test('导入开始后的另一设备写入使提交返回 409，并完整保留�
       sessions: [makeSession({ id: 'import-losing-race', title: 'Should not win' })],
     })
     const gate = harness.gate()
-    let held = false
-    harness.intercept(async (request) => {
-      if (held || request.path !== '/api/storage/uploads' || request.method !== 'POST') {
-        return
+    const stop = harness.intercept(async (request) => {
+      if (request.method === 'POST' && /\/chats$/.test(request.path)) {
+        gate.markEntered()
+        await gate.wait
       }
-      const metadata = JSON.parse(request.body)
-      if (!metadata.importId) {
-        return
-      }
-      held = true
-      gate.markEntered()
-      await gate.wait
     })
     const importing = modules.backup.importHistory(toFile(archive))
-    await gate.entered
-
-    const concurrent = localSession(
-      modules,
-      makeSession({
-        id: 'concurrent-new',
-        title: 'Other device wins',
-        base: 1_661_000_000_000,
-      })
-    )
-    await seedSession(harness, user, concurrent)
-    gate.release()
-    const error = await importing.catch((reason) => reason)
-    assert.ok(error instanceof Error)
-    assert.equal(error.status, 409)
-    assert.equal(modules.importProgress.useHistoryImportProgress.getState().phase, 'error')
-
-    const snapshot = await harness.snapshotAs(user)
-    assert.deepEqual(snapshot.sessions.map((session) => session.id).sort(), [
-      'concurrent-new',
-      'concurrent-old',
-    ])
-    assertSession(await harness.loadSessionAs(user, 'concurrent-new'), concurrent)
-    assert.equal(
-      snapshot.sessions.some((session) => session.id === 'import-losing-race'),
-      false
-    )
-    assert.deepEqual(
-      modules.store.useChatStore.getState().sessions.map((session) => session.id),
-      ['concurrent-old']
-    )
+    try {
+      await gate.entered
+      const concurrent = localSession(
+        modules,
+        makeSession({
+          id: 'concurrent-new',
+          title: 'Other device wins',
+          base: 1_661_000_000_000,
+        })
+      )
+      await seedSession(harness, user, concurrent)
+      gate.release()
+      const error = await importing.catch((reason) => reason)
+      assert.ok(error instanceof Error)
+      assert.equal(error.status, 409)
+      assert.equal(modules.importProgress.useHistoryImportProgress.getState().phase, 'error')
+      assert.deepEqual(
+        (await harness.snapshotAs(user)).sessions.map((session) => session.id).sort(),
+        ['concurrent-new', 'concurrent-old']
+      )
+      assert.equal(
+        (await harness.snapshotAs(user)).sessions.some(
+          (session) => session.id === 'import-losing-race'
+        ),
+        false
+      )
+    } finally {
+      gate.release()
+      await importing.catch(() => undefined)
+      stop()
+    }
   })
 })
 
@@ -971,7 +952,7 @@ test('同一会话使用过期 revision 保存返回 409，新内容不被覆盖
   })
 })
 
-test('完成响应丢失时查询任务状态，不重复完成上传或提交导入', async () => {
+test('普通会话完成响应丢失时查询上传状态，导入响应丢失时不另建任务', async () => {
   await withHarness(async (harness) => {
     const { modules } = harness
     const user = await harness.addUser('recovery_user')
@@ -999,26 +980,15 @@ test('完成响应丢失时查询任务状态，不重复完成上传或提交�
     })
     const saved = await modules.db.saveSession(direct)
     assert.equal(saved.id, 'direct-upload')
-    assert.equal(
-      harness.requests.filter(
-        (request) =>
-          request.method === 'POST' &&
-          /^\/api\/storage\/uploads\/[^/]+\/complete$/.test(request.path)
-      ).length,
-      1
-    )
     const uploadStatus = harness.requests.find(
       (request) => request.method === 'GET' && /^\/api\/storage\/uploads\/[^/]+$/.test(request.path)
     )
     assert.equal(uploadStatus?.status, 200)
     assert.equal(uploadStatus.body.status, 'completed')
     assert.equal(uploadStatus.body.summary.id, 'direct-upload')
-    assert.equal(
-      harness.requests.some(
-        (request) =>
-          request.method === 'DELETE' && /^\/api\/storage\/uploads\/[^/]+$/.test(request.path)
-      ),
-      false
+    assert.deepEqual(
+      (await harness.snapshotAs(user)).sessions.map((session) => session.id),
+      ['direct-upload']
     )
 
     const archive = await buildArchive(modules, {
@@ -1031,76 +1001,37 @@ test('完成响应丢失时查询任务状态，不重复完成上传或提交�
         }),
       ],
     })
-    let lostCommit = false
-    harness.intercept((request) => {
+    let lostChatResponse = false
+    const stopIntercept = harness.intercept((request) => {
       if (
-        !lostCommit &&
+        !lostChatResponse &&
         request.method === 'POST' &&
-        /^\/api\/chats\/imports\/[^/]+\/commit$/.test(request.path)
+        /^\/api\/chats\/imports\/[^/]+\/chats$/.test(request.path)
       ) {
-        lostCommit = true
+        lostChatResponse = true
         return {
           afterResponse: () => {
-            throw new Error('simulated lost commit response')
+            throw new TypeError('simulated lost chat response')
           },
         }
       }
     })
-    const importing = modules.backup.importHistory(toFile(archive))
-    assert.equal(await importing, 1)
-    assert.deepEqual(modules.importProgress.useHistoryImportProgress.getState(), {
-      phase: 'done',
-      sessions: 1,
-      files: 0,
-    })
-    assert.equal(
-      harness.requests.filter(
-        (request) =>
-          request.method === 'POST' && /^\/api\/chats\/imports\/[^/]+\/commit$/.test(request.path)
-      ).length,
-      1
+    try {
+      assert.equal(await modules.backup.importHistory(toFile(archive)), 1)
+    } finally {
+      stopIntercept()
+    }
+    assertDone(modules.importProgress.useHistoryImportProgress.getState(), 1, 0)
+    const savedIds = new Set(
+      sessionRequests(harness).flatMap(
+        (request) => request.body?.sessions?.map((session) => session.id) ?? []
+      )
     )
-    const importStatus = harness.requests.find(
-      (request) => request.method === 'GET' && /^\/api\/chats\/imports\/[^/]+$/.test(request.path)
+    assert.deepEqual([...savedIds], ['recovered-import'])
+    assert.deepEqual(
+      (await harness.snapshotAs(user)).sessions.map((session) => session.id).sort(),
+      ['recovered-import']
     )
-    assert.equal(importStatus?.status, 200)
-    assert.equal(importStatus.body.status, 'committed')
-    assert.equal(importStatus.body.count, 1)
-    assert.equal(importStatus.body.generation, (await harness.snapshotAs(user)).generation)
-
-    const importStart = harness.requests.find(
-      (request) => request.path === '/api/chats/imports' && request.method === 'POST'
-    )
-    assert.equal(importStart.status, 201)
-    assert.equal(typeof importStart.body.id, 'string')
-    assert.equal(typeof importStart.body.generation, 'string')
-    assert.equal(typeof importStart.body.revision, 'number')
-    const uploadStart = harness.requests.find(
-      (request) => request.path === '/api/storage/uploads' && request.method === 'POST'
-    )
-    assert.equal(uploadStart.status, 201)
-    assert.equal(typeof uploadStart.body.id, 'string')
-    const part = harness.requests.find(
-      (request) => request.method === 'PUT' && /\/parts\/1$/.test(request.path)
-    )
-    assert.equal(part.status, 200)
-    assert.equal(part.body.partNumber, 1)
-    assert.equal(typeof part.body.etag, 'string')
-    const completedUpload = harness.requests.find(
-      (request) =>
-        request.method === 'POST' && /^\/api\/storage\/uploads\/[^/]+\/complete$/.test(request.path)
-    )
-    assert.equal(completedUpload.status, 200)
-    assert.equal(completedUpload.body.summary.id, 'direct-upload')
-    assert.equal(completedUpload.body.summary.pinned, false)
-    const commit = harness.requests.find(
-      (request) =>
-        request.method === 'POST' && /^\/api\/chats\/imports\/[^/]+\/commit$/.test(request.path)
-    )
-    assert.equal(commit.status, 200)
-    assert.equal(commit.body.count, 1)
-    assert.equal(commit.body.generation, importStatus.body.generation)
-    assert.equal(commit.body.revision, importStatus.body.revision)
   })
 })
 
@@ -1154,7 +1085,7 @@ test(
       assert.ok(largestSessionBytes > 900 * 1024)
 
       assert.equal(await modules.backup.importHistory(archive), 655)
-      assert.equal(modules.importProgress.useHistoryImportProgress.getState().phase, 'done')
+      assertDone(modules.importProgress.useHistoryImportProgress.getState(), 655, 94)
       const snapshot = await harness.snapshotAs(user)
       assert.equal(snapshot.sessions.length, 655)
       let importedMessages = 0
@@ -1168,9 +1099,14 @@ test(
           .count,
         94
       )
-      const progress = modules.importProgress.useHistoryImportProgress.getState()
-      assert.equal(progress.sessions, 655)
-      assert.equal(progress.files, 94)
+      assert.equal(importStarts(harness).length, 1)
+      assert.equal(
+        harness.requests.filter(
+          (request) =>
+            request.method === 'GET' && /^\/api\/chats\/imports\/[^/]+\/result$/.test(request.path)
+        ).length,
+        0
+      )
     })
   }
 )

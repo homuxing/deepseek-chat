@@ -25,6 +25,7 @@ const runInFreshProject = (body) => {
         import { join } from 'node:path'
         import { buildWorkerCloudBundle, removeWorkerCloudBundle } from ${JSON.stringify(helperUrl)}
         const sourceDirectory = ${JSON.stringify(join(projectRoot, 'server'))}
+        const sharedDirectory = ${JSON.stringify(join(projectRoot, 'shared'))}
         const temporaryDirectory = join(process.cwd(), 'tmp')
         assert.equal(existsSync(temporaryDirectory), false)
         ${body}
@@ -42,6 +43,7 @@ const runInFreshProject = (body) => {
 test('全新工作目录可准备 Worker，并发调用共享构建结果且清理后可再次构建', () => {
   runInFreshProject(`
     cpSync(sourceDirectory, join(process.cwd(), 'server'), { recursive: true })
+    cpSync(sharedDirectory, join(process.cwd(), 'shared'), { recursive: true })
     const [first, concurrent] = await Promise.all([
       buildWorkerCloudBundle(),
       buildWorkerCloudBundle(),
@@ -62,6 +64,7 @@ test('Worker 构建失败只报告原错误，清理正常完成且修正输入�
     await assert.rejects(buildWorkerCloudBundle(), /Could not resolve/)
     await removeWorkerCloudBundle()
     cpSync(sourceDirectory, join(process.cwd(), 'server'), { recursive: true })
+    cpSync(sharedDirectory, join(process.cwd(), 'shared'), { recursive: true })
     const rebuilt = await buildWorkerCloudBundle()
     assert.equal(existsSync(rebuilt.outputFile), true)
     await removeWorkerCloudBundle()

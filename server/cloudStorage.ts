@@ -1,7 +1,9 @@
-import { Hono } from 'hono'
+import { Hono, type Context } from 'hono'
 import { HTTPException } from 'hono/http-exception'
 import { publishHistoryChange } from './sync.js'
 import type { AppEnv, UserRow } from './types.js'
+import { cleanupArchiveImport } from './archiveImport.js'
+import { sha256 } from './security.js'
 
 const MAX_ID_LENGTH = 128
 const MAX_MIME_TYPE_LENGTH = 255
@@ -66,6 +68,10 @@ type ImportRow = {
   status: 'staging' | 'committed' | 'cancelled'
   count: number
   revision: number
+  archive_mode: number
+  archive_ready: number
+  total_sessions: number | null
+  total_files: number | null
 }
 
 type UploadedPartRow = {
@@ -101,6 +107,465 @@ const isTimestamp = (value: unknown): value is number =>
 
 const isChatRevision = (value: unknown): value is number =>
   typeof value === 'number' && Number.isSafeInteger(value) && value >= 0
+
+const isMessage = (value: unknown): boolean => {
+  if (!isRecord(value) || !isValidId(value.id) || !isTimestamp(value.createdAt)) {
+    return false
+  }
+  if (
+    (value.parentId !== undefined && value.parentId !== null && !isValidId(value.parentId)) ||
+    (value.selectedChildId !== undefined && !isValidId(value.selectedChildId))
+  ) {
+    return false
+  }
+  if (value.role === 'user') {
+    return (
+      typeof value.content === 'string' &&
+      Array.isArray(value.files) &&
+      value.files.every(
+        (file) =>
+          isRecord(file) &&
+          isValidId(file.id) &&
+          (file.serverId === null || isValidId(file.serverId)) &&
+          typeof file.name === 'string' &&
+          typeof file.size === 'number' &&
+          Number.isFinite(file.size) &&
+          file.size >= 0 &&
+          typeof file.isImage === 'boolean' &&
+          typeof file.mimeType === 'string'
+      )
+    )
+  }
+  return (
+    value.role === 'assistant' &&
+    Array.isArray(value.blocks) &&
+    typeof value.prefix === 'boolean' &&
+    typeof value.status === 'string'
+  )
+}
+
+/** 导入批次正文沿用普通会话保存的字段规则，拒绝未知字段类型。 */
+const isValidSession = (value: unknown): value is JsonRecord => {
+  if (!isRecord(value)) {
+    return false
+  }
+  if (
+    !isValidId(value.id) ||
+    typeof value.title !== 'string' ||
+    !isTimestamp(value.createdAt) ||
+    !isTimestamp(value.updatedAt) ||
+    value.updatedAt < value.createdAt ||
+    !Array.isArray(value.messages) ||
+    !value.messages.every(isMessage)
+  ) {
+    return false
+  }
+  if (
+    value.rootMessageId !== undefined &&
+    value.rootMessageId !== null &&
+    !isValidId(value.rootMessageId)
+  ) {
+    return false
+  }
+  return value.pinned === undefined || typeof value.pinned === 'boolean'
+}
+
+const MAX_DIRECT_FILE_BYTES = 8 * 1024 * 1024
+
+/** 对象标识包含导入任务，重复请求可以确认结果，新任务可以复用原会话 ID。 */
+const directUploadId = async (importId: string, kind: 'chat' | 'file', objectId: string) =>
+  // 摘要采用 Base64URL，避免斜杠改变 R2 路径层级或破坏接口 ID。
+  `direct-${(await sha256(`${importId}:${kind}:${objectId}`)).replaceAll('+', '-').replaceAll('/', '_').replaceAll('=', '')}`
+
+const directUploadR2Key = (userId: string, uploadId: string, objectId: string) =>
+  `${userId}/imports/direct/${uploadId}/${objectId}`
+
+const directSessionSummary = (
+  session: JsonRecord,
+  generation: string,
+  revision: number
+): SessionSummary => ({
+  id: session.id as string,
+  title: session.title as string,
+  createdAt: session.createdAt as number,
+  updatedAt: session.updatedAt as number,
+  pinned: session.pinned === true,
+  revision,
+  generation,
+})
+
+/** 清理失败仍报告原始写入错误，暂存记录保留供定期清理。 */
+const reportDirectCleanup = (error: unknown) => {
+  // eslint-disable-next-line no-console
+  console.error('导入暂存内容清理失败', error)
+}
+
+const rollbackDirectUploads = async (
+  env: AppEnv['Bindings'],
+  userId: string,
+  ids: string[],
+  keys: string[]
+): Promise<void> => {
+  await env.DB.prepare(
+    `UPDATE cloud_uploads SET status = 'failed', updated_at = ?
+     WHERE user_id = ? AND id IN (SELECT value FROM json_each(?)) AND status = 'uploading'`
+  )
+    .bind(Date.now(), userId, JSON.stringify(ids))
+    .run()
+  const current = await stagedUploads(env, userId, ids)
+  // D1 可能已提交但响应丢失，已完成对象必须继续保留。
+  await deleteR2Keys(
+    env,
+    keys.filter((_key, index) => current.get(ids[index])?.status !== 'completed')
+  )
+}
+
+const stagedUploads = async (
+  env: AppEnv['Bindings'],
+  userId: string,
+  ids: string[]
+): Promise<Map<string, UploadRow>> => {
+  const rows = await env.DB.prepare(
+    `SELECT id, kind, object_id, generation, import_id, base_revision,
+            r2_key, multipart_id, summary_json, files_json, mime_type,
+            completed_revision, status
+     FROM cloud_uploads WHERE user_id = ? AND id IN (SELECT value FROM json_each(?))`
+  )
+    .bind(userId, JSON.stringify(ids))
+    .all<UploadRow>()
+  return new Map(rows.results.map((row) => [row.id, row]))
+}
+
+/** 小会话批次共用一次登记和发布事务，正文以最多四个 R2 写入任务并发保存。 */
+const saveDirectChatBatch = async (
+  env: AppEnv['Bindings'],
+  user: UserRow,
+  sessionTokenHash: string,
+  importId: string,
+  generation: string,
+  baseRevision: number,
+  sessions: JsonRecord[]
+): Promise<SessionSummary[] | { message: string; status: number }> => {
+  const items = await Promise.all(
+    sessions.map(async (session) => {
+      const id = await directUploadId(importId, 'chat', session.id as string)
+      const body = JSON.stringify(session)
+      const summary = directSessionSummary(session, generation, baseRevision)
+      return {
+        id,
+        objectId: session.id as string,
+        body,
+        key: directUploadR2Key(user.id, id, session.id as string),
+        summary,
+        summaryJson: JSON.stringify({ ...summary, contentHash: await sha256(body) }),
+        files: fileIdsFromSession(session),
+      }
+    })
+  )
+  const existing = await stagedUploads(
+    env,
+    user.id,
+    items.map((item) => item.id)
+  )
+  const recover = (uploads: Map<string, UploadRow>) =>
+    items.every((item) => {
+      const upload = uploads.get(item.id)
+      return (
+        upload?.status === 'completed' &&
+        upload.kind === 'chat' &&
+        upload.object_id === item.objectId &&
+        upload.import_id === importId &&
+        upload.generation === generation &&
+        upload.base_revision === baseRevision &&
+        upload.summary_json === item.summaryJson
+      )
+    })
+  const pending = items.filter((item) => !existing.has(item.id))
+  for (const item of items) {
+    const upload = existing.get(item.id)
+    if (
+      upload &&
+      (upload.status !== 'completed' ||
+        upload.summary_json !== item.summaryJson ||
+        upload.import_id !== importId ||
+        upload.generation !== generation)
+    ) {
+      return { message: '会话上传内容或任务状态已变化', status: 409 }
+    }
+  }
+  if (!pending.length) {
+    return recover(existing)
+      ? items.map((item) => item.summary)
+      : { message: '无法确认会话上传结果', status: 409 }
+  }
+  const payload = JSON.stringify(
+    pending.map((item) => ({
+      id: item.id,
+      objectId: item.objectId,
+      key: item.key,
+      summary: item.summary,
+      summaryJson: item.summaryJson,
+      files: item.files,
+    }))
+  )
+  const now = Date.now()
+  // 单条集合 SQL 取得整批写入权；任何 ID 已被占用时不登记部分批次。
+  const claimed = await env.DB.prepare(
+    `INSERT INTO cloud_uploads
+       (user_id, id, kind, object_id, generation, import_id, base_revision,
+        r2_key, multipart_id, summary_json, files_json, status, created_at, updated_at)
+     SELECT ?, json_extract(entry.value, '$.id'), 'chat', json_extract(entry.value, '$.objectId'),
+       ?, ?, ?, json_extract(entry.value, '$.key'), '', json_extract(entry.value, '$.summaryJson'),
+       json_extract(entry.value, '$.files'), 'uploading', ?, ?
+     FROM json_each(?) entry
+     WHERE EXISTS (
+       SELECT 1 FROM cloud_imports WHERE user_id = ? AND id = ? AND status = 'staging'
+         AND archive_mode = 0 AND generation = ? AND base_revision = ?
+     ) AND ${liveSessionSql}
+     AND NOT EXISTS (
+       SELECT 1 FROM cloud_uploads WHERE user_id = ?
+         AND id IN (SELECT json_extract(value, '$.id') FROM json_each(?))
+     ) RETURNING id`
+  )
+    .bind(
+      user.id,
+      generation,
+      importId,
+      baseRevision,
+      now,
+      now,
+      payload,
+      user.id,
+      importId,
+      generation,
+      baseRevision,
+      sessionTokenHash,
+      user.id,
+      now,
+      user.id,
+      payload
+    )
+    .all<{ id: string }>()
+  if (claimed.results.length !== pending.length) {
+    const latest = await stagedUploads(
+      env,
+      user.id,
+      items.map((item) => item.id)
+    )
+    return recover(latest)
+      ? items.map((item) => item.summary)
+      : { message: '会话正在保存或导入任务已变化', status: 409 }
+  }
+  const rollback = () =>
+    rollbackDirectUploads(
+      env,
+      user.id,
+      pending.map((item) => item.id),
+      pending.map((item) => item.key)
+    )
+  try {
+    let cursor = 0
+    let failed = false
+    let failure: unknown
+    await Promise.all(
+      Array.from({ length: Math.min(4, pending.length) }, async () => {
+        while (!failed && cursor < pending.length) {
+          const item = pending[cursor++]
+          try {
+            await env.FILES.put(item.key, item.body, {
+              httpMetadata: { contentType: 'application/json; charset=utf-8' },
+            })
+          } catch (error) {
+            if (!failed) {
+              failed = true
+              failure = error
+            }
+          }
+        }
+      })
+    )
+    if (failed) {
+      throw failure
+    }
+    const results = await env.DB.batch([
+      env.DB.prepare(
+        `INSERT INTO chats
+           (user_id, generation, id, revision, title, pinned, created_at, updated_at, data_json, body_key)
+         SELECT ?, ?, json_extract(entry.value, '$.objectId'), ?,
+           json_extract(entry.value, '$.summary.title'), json_extract(entry.value, '$.summary.pinned'),
+           json_extract(entry.value, '$.summary.createdAt'), json_extract(entry.value, '$.summary.updatedAt'),
+           '{}', json_extract(entry.value, '$.key')
+         FROM json_each(?) entry
+         WHERE EXISTS (
+           SELECT 1 FROM cloud_imports WHERE user_id = ? AND id = ? AND status = 'staging'
+             AND archive_mode = 0 AND generation = ? AND base_revision = ?
+         ) AND ${liveSessionSql}
+         AND (SELECT COUNT(*) FROM cloud_uploads WHERE user_id = ? AND status = 'uploading'
+           AND id IN (SELECT json_extract(value, '$.id') FROM json_each(?))) = ?`
+      ).bind(
+        user.id,
+        generation,
+        baseRevision,
+        payload,
+        user.id,
+        importId,
+        generation,
+        baseRevision,
+        sessionTokenHash,
+        user.id,
+        Date.now(),
+        user.id,
+        payload,
+        pending.length
+      ),
+      env.DB.prepare(
+        `INSERT INTO chat_files (user_id, generation, chat_id, file_id)
+         SELECT ?, ?, json_extract(entry.value, '$.objectId'), file.value
+         FROM json_each(?) entry JOIN json_each(entry.value, '$.files') file
+         WHERE EXISTS (
+           SELECT 1 FROM chats WHERE user_id = ? AND generation = ?
+             AND id = json_extract(entry.value, '$.objectId') AND body_key = json_extract(entry.value, '$.key')
+         )`
+      ).bind(user.id, generation, payload, user.id, generation),
+      env.DB.prepare(
+        `UPDATE cloud_uploads SET status = 'completed', completed_revision = ?, updated_at = ?
+         WHERE user_id = ? AND import_id = ? AND status = 'uploading'
+           AND id IN (SELECT json_extract(value, '$.id') FROM json_each(?))
+           AND EXISTS (SELECT 1 FROM chats WHERE user_id = cloud_uploads.user_id
+             AND generation = cloud_uploads.generation AND id = cloud_uploads.object_id
+             AND body_key = cloud_uploads.r2_key)`
+      ).bind(baseRevision, Date.now(), user.id, importId, payload),
+      env.DB.prepare(
+        `UPDATE cloud_imports SET count = (SELECT COUNT(*) FROM chats WHERE user_id = ? AND generation = ?),
+           updated_at = ? WHERE user_id = ? AND id = ? AND status = 'staging'`
+      ).bind(user.id, generation, Date.now(), user.id, importId),
+    ])
+    if (results[0].meta.changes !== pending.length || results[2].meta.changes !== pending.length) {
+      await rollback()
+      return { message: '导入任务已取消或登录状态已变化', status: 409 }
+    }
+    return items.map((item) => item.summary)
+  } catch (error) {
+    await rollback().catch(reportDirectCleanup)
+    throw error
+  }
+}
+
+/** 普通附件完整上传一次，先保存暂存 metadata，提交事务再发布到账号文件目录。 */
+const saveDirectFile = async (
+  c: Context<AppEnv>,
+  importId: string,
+  fileId: string,
+  mimeType: string
+): Promise<{ id: string; error?: { message: string; status: number } }> => {
+  const user = c.get('user')
+  const imported = await getImport(c.env, user.id, importId)
+  const conflict = { id: fileId, error: { message: '附件内容或导入任务状态已变化', status: 409 } }
+  if (!imported || imported.status !== 'staging' || imported.archive_mode !== 0) {
+    return conflict
+  }
+  let bytes: ArrayBuffer
+  try {
+    bytes = await c.req.raw.arrayBuffer()
+  } catch {
+    return { id: fileId, error: { message: '上传连接已中断', status: 408 } }
+  }
+  if (bytes.byteLength > MAX_DIRECT_FILE_BYTES) {
+    return { id: fileId, error: { message: '附件大小无效', status: 413 } }
+  }
+  const id = await directUploadId(importId, 'file', fileId)
+  const key = directUploadR2Key(user.id, id, fileId)
+  const contentHash = Array.from(
+    new Uint8Array(await crypto.subtle.digest('SHA-256', bytes)),
+    (byte) => byte.toString(16).padStart(2, '0')
+  ).join('')
+  const summaryJson = JSON.stringify({ contentHash, size: bytes.byteLength })
+  const now = Date.now()
+  const registered = await c.env.DB.prepare(
+    `INSERT INTO cloud_uploads
+       (user_id, id, kind, object_id, generation, import_id, base_revision, r2_key,
+        multipart_id, mime_type, summary_json, status, created_at, updated_at)
+     SELECT ?, ?, 'file', ?, ?, ?, ?, ?, '', ?, ?, 'uploading', ?, ?
+     WHERE EXISTS (SELECT 1 FROM cloud_imports WHERE user_id = ? AND id = ? AND status = 'staging'
+       AND archive_mode = 0 AND generation = ? AND base_revision = ?)
+       AND ${liveSessionSql}
+     ON CONFLICT(user_id, id) DO NOTHING`
+  )
+    .bind(
+      user.id,
+      id,
+      fileId,
+      imported.generation,
+      importId,
+      imported.base_revision,
+      key,
+      mimeType,
+      summaryJson,
+      now,
+      now,
+      user.id,
+      importId,
+      imported.generation,
+      imported.base_revision,
+      c.get('sessionTokenHash'),
+      user.id,
+      now
+    )
+    .run()
+  if (registered.meta.changes === 0) {
+    const upload = await findUpload(c.env, user.id, id)
+    return upload?.status === 'completed' &&
+      upload.object_id === fileId &&
+      upload.import_id === importId &&
+      upload.mime_type === mimeType &&
+      upload.summary_json === summaryJson
+      ? { id: fileId }
+      : conflict
+  }
+  const rollback = () => rollbackDirectUploads(c.env, user.id, [id], [key])
+  try {
+    await c.env.FILES.put(key, bytes, { httpMetadata: { contentType: mimeType } })
+    const result = await c.env.DB.batch([
+      c.env.DB.prepare(
+        `INSERT INTO cloud_archive_files (user_id, import_id, file_id, r2_key, mime_type, size, created_at)
+         SELECT ?, ?, ?, ?, ?, ?, ?
+         WHERE EXISTS (SELECT 1 FROM cloud_imports WHERE user_id = ? AND id = ? AND status = 'staging'
+           AND archive_mode = 0 AND generation = ? AND base_revision = ?)
+           AND EXISTS (SELECT 1 FROM cloud_uploads WHERE user_id = ? AND id = ? AND status = 'uploading')
+           AND ${liveSessionSql}`
+      ).bind(
+        user.id,
+        importId,
+        fileId,
+        key,
+        mimeType,
+        bytes.byteLength,
+        now,
+        user.id,
+        importId,
+        imported.generation,
+        imported.base_revision,
+        user.id,
+        id,
+        c.get('sessionTokenHash'),
+        user.id,
+        Date.now()
+      ),
+      c.env.DB.prepare(
+        `UPDATE cloud_uploads SET status = 'completed', updated_at = ?
+         WHERE user_id = ? AND id = ? AND status = 'uploading' AND changes() = 1`
+      ).bind(Date.now(), user.id, id),
+    ])
+    if (result[0].meta.changes !== 1 || result[1].meta.changes !== 1) {
+      await rollback()
+      return conflict
+    }
+    return { id: fileId }
+  } catch (error) {
+    await rollback().catch(reportDirectCleanup)
+    throw error
+  }
+}
 
 const jsonResponse = (value: unknown, status = 200): Response =>
   new Response(JSON.stringify(value), {
@@ -1027,13 +1492,15 @@ const cleanupCancelledUpload = async (
   upload: Pick<UploadRow, 'id' | 'r2_key' | 'multipart_id'>
 ): Promise<void> => {
   try {
-    await env.FILES.resumeMultipartUpload(upload.r2_key, upload.multipart_id).abort()
+    if (upload.multipart_id) {
+      await env.FILES.resumeMultipartUpload(upload.r2_key, upload.multipart_id).abort()
+    }
   } catch (error) {
     // 已完成或已取消的 multipart 不再存在，仍需检查是否留下未引用对象。
     const missing =
       error instanceof Error &&
       /NoSuchUpload|multipart upload not found|multipart upload does not exist/i.test(error.message)
-    if (!missing || (await isR2KeyReferenced(env, userId, upload.r2_key))) {
+    if (!missing) {
       throw error
     }
   }
@@ -1056,7 +1523,7 @@ const cancelImportUploads = async (
 ): Promise<void> => {
   await env.DB.prepare(
     `UPDATE cloud_uploads SET status = 'cancelled', updated_at = ?
-     WHERE user_id = ? AND import_id = ? AND status IN ('uploading', 'completing', 'failed')
+     WHERE user_id = ? AND import_id = ? AND status IN ('uploading', 'completing', 'failed', 'completed')
        AND EXISTS (
          SELECT 1 FROM cloud_imports WHERE user_id = ? AND id = ? AND status = 'cancelled'
        )`
@@ -1136,6 +1603,7 @@ export const cleanupAbandonedStorage = async (env: AppEnv['Bindings']): Promise<
       await cancelImportUploads(env, imported.user_id, imported.id)
       await cleanupExpiredGenerations(env, imported.user_id)
       await cleanupImportFiles(env, imported.user_id, imported.id)
+      await cleanupArchiveImport(env, imported.user_id, imported.id)
     }
   }
 
@@ -1171,6 +1639,7 @@ const getImport = async (
 ): Promise<ImportRow | null> =>
   env.DB.prepare(
     `SELECT imported.id, imported.generation, imported.base_revision,
+            imported.archive_mode, imported.archive_ready, imported.total_sessions, imported.total_files,
             imported.status, imported.count,
             CASE
               WHEN imported.status = 'committed' THEN history.revision
@@ -1184,6 +1653,96 @@ const getImport = async (
     .first<ImportRow>()
 
 export const cloudStorageRoutes = new Hono<AppEnv>()
+
+cloudStorageRoutes.get('/chats/imports/:id/result', async (c) => {
+  const userId = c.get('user').id
+  const imported = await getImport(c.env, userId, c.req.param('id'))
+  if (!imported || imported.archive_mode !== 1) {
+    return errorResponse('导入任务不存在', 404)
+  }
+  if (imported.status !== 'committed') {
+    return errorResponse('导入尚未完成', 409)
+  }
+  const listed = await listActiveChats(c.env, userId)
+  if (listed.generation !== imported.generation) {
+    return errorResponse('导入后历史已更新', 409)
+  }
+  return jsonResponse({
+    ...listed,
+    count: imported.count,
+    files: imported.total_files,
+    totalSessions: imported.total_sessions,
+    totalFiles: imported.total_files,
+  })
+})
+
+cloudStorageRoutes.post('/chats/imports/:id/chats', async (c) => {
+  const user = c.get('user')
+  const importId = c.req.param('id')
+  let body: unknown
+  try {
+    body = await readJson(c.req.raw)
+  } catch {
+    return errorResponse('请求内容不是有效 JSON')
+  }
+  if (!isRecord(body) || !Array.isArray(body.sessions)) {
+    return errorResponse('sessions 必须是数组')
+  }
+  if (body.sessions.length < 1 || body.sessions.length > 16) {
+    return errorResponse('每批只能提交 1 至 16 个会话')
+  }
+  if (!body.sessions.every(isValidSession)) {
+    return errorResponse('会话内容无效')
+  }
+  const ids = body.sessions.map((session) => session.id as string)
+  if (new Set(ids).size !== ids.length) {
+    return errorResponse('同一批次存在重复会话')
+  }
+  const imported = await getImport(c.env, user.id, importId)
+  if (!imported || imported.status !== 'staging' || imported.archive_mode !== 0) {
+    return errorResponse('导入任务不存在或已经结束', 409)
+  }
+  const result = await saveDirectChatBatch(
+    c.env,
+    user,
+    c.get('sessionTokenHash'),
+    importId,
+    imported.generation,
+    imported.base_revision,
+    body.sessions
+  )
+  if (!Array.isArray(result)) {
+    return errorResponse(result.message, result.status)
+  }
+  return jsonResponse({ count: result.length, sessions: result })
+})
+
+cloudStorageRoutes.put('/chats/imports/:id/files/:fileId', async (c) => {
+  const user = c.get('user')
+  const importId = c.req.param('id')
+  const fileId = c.req.param('fileId')
+  if (!isValidId(fileId)) {
+    return errorResponse('附件 ID 无效')
+  }
+  const contentType = c.req.header('Content-Type')?.split(';')[0]?.trim().toLowerCase()
+  if (
+    !contentType ||
+    contentType.includes('/') === false ||
+    contentType.length > MAX_MIME_TYPE_LENGTH ||
+    /[\r\n]/.test(contentType)
+  ) {
+    return errorResponse('请提供具体的附件类型')
+  }
+  const imported = await getImport(c.env, user.id, importId)
+  if (!imported || imported.status !== 'staging' || imported.archive_mode !== 0) {
+    return errorResponse('导入任务不存在或已经结束', 409)
+  }
+  const saved = await saveDirectFile(c, importId, fileId, contentType)
+  if (saved.error) {
+    return errorResponse(saved.error.message, saved.error.status)
+  }
+  return jsonResponse({ id: saved.id })
+})
 
 cloudStorageRoutes.get('/chats/imports/:id', async (c) => {
   const imported = await getImport(c.env, c.get('user').id, c.req.param('id'))
@@ -1256,12 +1815,11 @@ cloudStorageRoutes.delete('/chats/imports/:id', async (c) => {
   await cancelImportUploads(c.env, user.id, id)
   await cleanupExpiredGenerations(c.env, user.id)
   await cleanupImportFiles(c.env, user.id, id)
+  await cleanupArchiveImport(c.env, user.id, id)
   return noContent()
 })
 
 cloudStorageRoutes.post('/chats/imports/:id/commit', async (c) => {
-  const user = c.get('user')
-  const id = c.req.param('id')
   let body: unknown
   try {
     body = await readJson(c.req.raw)
@@ -1276,6 +1834,11 @@ cloudStorageRoutes.post('/chats/imports/:id/commit', async (c) => {
   ) {
     return errorResponse('count 必须是非负整数')
   }
+  return commitImport(c, c.req.param('id'), body.count)
+})
+
+const commitImport = async (c: Context<AppEnv>, id: string, count: number): Promise<Response> => {
+  const user = c.get('user')
   const imported = await getImport(c.env, user.id, id)
   if (!imported) {
     return errorResponse('导入任务不存在', 404)
@@ -1285,7 +1848,7 @@ cloudStorageRoutes.post('/chats/imports/:id/commit', async (c) => {
   }
   if (imported.status === 'committed') {
     const active = await ensureActiveHistory(c.env, user.id)
-    if (active.generation !== imported.generation || imported.count !== body.count) {
+    if (active.generation !== imported.generation || imported.count !== count) {
       return errorResponse('导入任务已提交，但当前账号历史已变化', 409)
     }
     const listed = await listActiveChats(c.env, user.id)
@@ -1294,7 +1857,17 @@ cloudStorageRoutes.post('/chats/imports/:id/commit', async (c) => {
       generation: listed.generation,
       revision: listed.revision,
       count: imported.count,
+      ...(imported.archive_mode === 1
+        ? {
+            files: imported.total_files,
+            totalFiles: imported.total_files,
+            totalSessions: imported.total_sessions,
+          }
+        : {}),
     })
+  }
+  if (imported.archive_mode === 1 && imported.archive_ready !== 1) {
+    return errorResponse('导入文件尚未处理完成', 409)
   }
 
   const actual = await c.env.DB.prepare(
@@ -1302,7 +1875,7 @@ cloudStorageRoutes.post('/chats/imports/:id/commit', async (c) => {
   )
     .bind(user.id, imported.generation)
     .first<{ count: number }>()
-  if (!actual || Number(actual.count) !== body.count) {
+  if (!actual || Number(actual.count) !== count) {
     return errorResponse('导入会话数量与已上传数量不一致', 409)
   }
   const unfinished = await c.env.DB.prepare(
@@ -1324,6 +1897,8 @@ cloudStorageRoutes.post('/chats/imports/:id/commit', async (c) => {
            SELECT 1 FROM cloud_imports
            WHERE user_id = ? AND id = ? AND status = 'staging'
              AND generation = ? AND base_revision = ?
+             AND (archive_mode = 0 OR (archive_ready = 1 AND total_sessions = count
+               AND total_files = (SELECT COUNT(*) FROM cloud_archive_files WHERE user_id = ? AND import_id = ?)))
          )
          AND (SELECT COUNT(*) FROM chats WHERE user_id = ? AND generation = ?) = ?
          AND NOT EXISTS (
@@ -1340,8 +1915,10 @@ cloudStorageRoutes.post('/chats/imports/:id/commit', async (c) => {
       imported.generation,
       imported.base_revision,
       user.id,
+      id,
+      user.id,
       imported.generation,
-      body.count,
+      count,
       user.id,
       id,
       c.get('sessionTokenHash'),
@@ -1352,7 +1929,7 @@ cloudStorageRoutes.post('/chats/imports/:id/commit', async (c) => {
       `UPDATE cloud_imports SET status = 'committed', count = ?, updated_at = ?
        WHERE user_id = ? AND id = ? AND status = 'staging'
          AND changes() = 1`
-    ).bind(body.count, Date.now(), user.id, id),
+    ).bind(count, Date.now(), user.id, id),
     c.env.DB.prepare(
       `UPDATE chats SET revision = ?
        WHERE user_id = ? AND generation = ?
@@ -1362,6 +1939,16 @@ cloudStorageRoutes.post('/chats/imports/:id/commit', async (c) => {
            WHERE user_id = ? AND generation = ? AND revision = ?
          )`
     ).bind(nextRevision, user.id, imported.generation, user.id, imported.generation, nextRevision),
+    c.env.DB.prepare(
+      `INSERT INTO files (user_id, id, r2_key, mime_type, size, created_at)
+       SELECT staged.user_id, staged.file_id, staged.r2_key, staged.mime_type, staged.size, staged.created_at
+       FROM cloud_archive_files staged
+       WHERE staged.user_id = ? AND staged.import_id = ? AND EXISTS (
+         SELECT 1 FROM cloud_imports imported JOIN cloud_history history ON history.user_id = imported.user_id
+         WHERE imported.user_id = ? AND imported.id = ? AND imported.status = 'committed'
+           AND history.generation = imported.generation
+       )`
+    ).bind(user.id, id, user.id, id),
   ])
   if (results[0].meta.changes === 0) {
     const live = await c.env.DB.prepare(`SELECT ${liveSessionSql} AS live`)
@@ -1383,8 +1970,15 @@ cloudStorageRoutes.post('/chats/imports/:id/commit', async (c) => {
     generation: listed.generation,
     revision: listed.revision,
     count: results[2].meta.changes,
+    ...(imported.archive_mode === 1
+      ? {
+          files: imported.total_files,
+          totalFiles: imported.total_files,
+          totalSessions: imported.total_sessions,
+        }
+      : {}),
   })
-})
+}
 
 cloudStorageRoutes.post('/storage/uploads', async (c) => {
   const user = c.get('user')
@@ -1413,6 +2007,9 @@ cloudStorageRoutes.post('/storage/uploads', async (c) => {
     const imported = await getImport(c.env, user.id, body.importId)
     if (!imported || imported.status !== 'staging') {
       return errorResponse('导入任务不存在或已经结束', 409)
+    }
+    if (imported.archive_mode === 1) {
+      return errorResponse('整包导入不接受单独上传内容', 409)
     }
     importId = imported.id
     generation = imported.generation

@@ -7,11 +7,12 @@ import {
   captureBackendIdentity,
   onBackendIdentityChange,
 } from '../backend.js'
-import { setHistoryImportProgress } from './importProgress.js'
+import { importArchiveUpload } from './importArchiveUpload.js'
+import { resetHistoryImportProgress, setHistoryImportProgress } from './importProgress.js'
 
 export { BackupError } from './history/errors.js'
 
-// 导入、导出与全部删除串行处理，避免读取归档时数据被清空或两个替换事务交错。
+// 导出与全部删除串行处理，避免读取归档时数据被清空或替换事务交错。
 let backupQueue: Promise<unknown> = Promise.resolve()
 let importActive = false
 
@@ -61,8 +62,8 @@ export const exportHistory = (): Promise<{ name: string; blob: Blob }> => {
 }
 
 /**
- * 确认覆盖后调用：先检查 ZIP 格式与版本，校验失败时保留正在生成的回答；
- * 通过后从 ZIP 流式写入暂存，成功才替换原有会话与图片原件。返回导入的会话数。
+ * 确认覆盖后调用：前端解析与并发上传在替换事务内完成，期间禁止会话修改并等待旧保存结束。
+ * 活跃状态与离开保护从调用瞬间开始，直到队列、替换事务和最终状态更新全部结束。
  */
 export const importHistory = (file: File): Promise<number> => {
   if (importActive) {
@@ -79,58 +80,56 @@ export const importHistory = (file: File): Promise<number> => {
   if (typeof window !== 'undefined') {
     window.addEventListener('beforeunload', preventLeave)
   }
-  const unsubscribe = onBackendIdentityChange(() => {
+  const unsubscribeIdentity = onBackendIdentityChange(() => {
     try {
       assertBackendIdentity(identity)
     } catch {
       controller.abort()
     }
   })
-  setHistoryImportProgress({ phase: 'preparing', sessions: 0, files: 0, preparedPercent: 0 })
-  return enqueueBackup(async () => {
-    assertBackendIdentity(identity)
-    const { prepareImportSource } = await import('./history/importSource.js')
-    const { checkArchiveFormat, importArchive } = await import('./history/importArchive.js')
-    const source = await prepareImportSource(file, controller.signal, (bytes) => {
-      setHistoryImportProgress({
-        preparedPercent: file.size ? Math.floor((bytes / file.size) * 100) : 100,
-      })
-    })
+  // 排队期间同样展示导入进度，防止提前关闭设置或再次点击导入。
+  resetHistoryImportProgress()
+  setHistoryImportProgress({ phase: 'checking', sessions: 0, files: 0 })
+  const task = enqueueBackup(async () => {
     try {
-      setHistoryImportProgress({ phase: 'checking' })
-      await checkArchiveFormat(source.file)
+      assertBackendIdentity(identity)
+      await db.waitForStorageWrites()
+      assertBackendIdentity(identity)
       const count = await replaceHistory(async () => {
-        const cloud = await db.createCloudImport(identity, controller.signal)
-        try {
-          setHistoryImportProgress({ phase: 'uploading', sessions: 0, files: 0 })
-          await importArchive(source.file, cloud.sink)
-          return await cloud.commit()
-        } catch (error) {
-          await cloud.cancel().catch(db.reportStorageError('取消未完成导入'))
-          throw error
+        const result = await importArchiveUpload(file, identity, controller.signal)
+        assertBackendIdentity(identity)
+        if (result.sessions.length !== result.count) {
+          throw new Error('导入结果中的会话数量不一致')
         }
+        setHistoryImportProgress({
+          phase: 'committing',
+          sessions: result.count,
+          files: result.files,
+          totalSessions: result.totalSessions,
+          totalFiles: result.totalFiles,
+        })
+        return result.sessions
       }, identity)
       assertBackendIdentity(identity)
+      // 只更新最终阶段和会话数，保留处理阶段收到的真实附件计数。
       setHistoryImportProgress({ phase: 'done', sessions: count })
       return count
-    } finally {
-      await source.dispose().catch(db.reportStorageError('清理导入文件副本'))
-    }
-  })
-    .catch((error: unknown) => {
-      setHistoryImportProgress({
-        phase: 'error',
-        error: error instanceof Error ? error.message : String(error),
-      })
+    } catch (error) {
+      let message = error instanceof Error ? error.message : String(error)
+      if (controller.signal.aborted) {
+        message = '登录账号已变更，导入已取消'
+      }
+      setHistoryImportProgress({ phase: 'error', error: message })
       throw error
-    })
-    .finally(() => {
-      importActive = false
-      unsubscribe()
+    } finally {
       if (typeof window !== 'undefined') {
         window.removeEventListener('beforeunload', preventLeave)
       }
-    })
+      unsubscribeIdentity()
+      importActive = false
+    }
+  })
+  return task
 }
 
 /** 确认删除后调用：以空历史原子替换全部本地会话与附件，保留 API Key 和其他设置。 */

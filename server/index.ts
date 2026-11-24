@@ -18,7 +18,7 @@ const publicPaths = new Set([
   '/api/admin/login',
 ])
 
-// Reject anonymous uploads before reading their bodies.
+// 在读取上传正文之前拒绝未登录请求。
 app.use('/api/*', async (c, next) => {
   c.header('Cache-Control', 'no-store')
   c.header('X-Content-Type-Options', 'nosniff')
@@ -56,13 +56,22 @@ app.use('/api/*', async (c, next) => {
     c.req.method === 'POST' &&
     (/^\/api\/files\/[^/]+$/.test(c.req.path) || c.req.path === '/api/anthropic/v1/files')
   const multipartPart = /^\/api\/storage\/uploads\/[^/]+\/parts\/\d+$/.test(c.req.path)
+  // 会话批次与直传附件分别限制请求大小，控制单次处理量。
+  const directImportFile =
+    c.req.method === 'PUT' && /^\/api\/chats\/imports\/[^/]+\/files\/[^/]+$/.test(c.req.path)
+  const directImportChats =
+    c.req.method === 'POST' && /^\/api\/chats\/imports\/[^/]+\/chats$/.test(c.req.path)
   const size = multipartPart
     ? 10 * 1024 * 1024
     : fileUpload
       ? 65 * 1024 * 1024
-      : c.req.path === '/api/v1/tools/asr'
-        ? 9 * 1024 * 1024
-        : 1024 * 1024
+      : directImportFile
+        ? 8 * 1024 * 1024
+        : directImportChats
+          ? 256 * 1024
+          : c.req.path === '/api/v1/tools/asr'
+            ? 9 * 1024 * 1024
+            : 1024 * 1024
   if (multipartPart && c.req.method === 'PUT' && c.req.raw.body) {
     // 在大小检查入口识别连接中断，完整读取一个分片后才允许写入 R2。
     const reader = c.req.raw.body.getReader()
@@ -139,6 +148,9 @@ app.onError((error, c) => {
     return c.json({ error: { message: error.message } }, error.status)
   }
   // Keep database details and encrypted credentials out of public responses.
+  // 服务端记录原始异常供定位，响应只包含公开错误文案。
+  // eslint-disable-next-line no-console
+  console.error('服务器请求处理失败', error)
   return c.json({ error: { message: '服务器处理失败，请稍后重试' } }, 500)
 })
 

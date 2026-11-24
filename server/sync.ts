@@ -33,7 +33,7 @@ export class HistorySync {
     return new Response(null, { status: 101, webSocket: pair[0] })
   }
 
-  private async broadcast(): Promise<void> {
+  private async broadcast(message: unknown = { type: 'changed' }): Promise<void> {
     const sockets = this.state.getWebSockets()
     // 推送前重新检查每条连接，密码重置、退出和会话过期后不继续接收通知。
     for (const socket of sockets) {
@@ -54,7 +54,7 @@ export class HistorySync {
         if (!session) {
           socket.close(1008, '登录状态已变更')
         } else {
-          socket.send(JSON.stringify({ type: 'changed' }))
+          socket.send(JSON.stringify(message))
         }
       } catch (error) {
         // 单条连接异常不阻止其他设备；关闭后客户端自动重连并读取最新历史。

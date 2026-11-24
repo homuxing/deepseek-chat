@@ -2,9 +2,9 @@ import { create } from 'zustand'
 
 export type HistoryImportPhase =
   | 'idle'
-  | 'preparing'
   | 'checking'
   | 'uploading'
+  | 'processing'
   | 'committing'
   | 'done'
   | 'error'
@@ -14,7 +14,11 @@ export type HistoryImportProgress = {
   sessions: number
   files: number
   error?: string
+  /** 仅上传阶段可带字节进度；无值时进度条显示不确定状态。 */
   preparedPercent?: number
+  /** ZIP 目录中的对话和去重附件总量；缺失时进度条保持不确定状态。 */
+  totalSessions?: number
+  totalFiles?: number
   waiting?: boolean
 }
 
@@ -37,7 +41,8 @@ export const setHistoryImportProgress = (progress: Partial<HistoryImportProgress
     if (progress.phase && progress.phase !== 'error') {
       delete next.error
     }
-    if (progress.phase && progress.phase !== 'preparing') {
+    // 字节进度只在上传阶段有效，切换阶段后立即清除旧值。
+    if (progress.phase && progress.phase !== 'uploading') {
       delete next.preparedPercent
     }
     if (progress.waiting === undefined) {
@@ -52,4 +57,4 @@ export const resetHistoryImportProgress = (): void => {
 }
 
 export const isHistoryImportActive = (phase: HistoryImportPhase): boolean =>
-  phase === 'preparing' || phase === 'checking' || phase === 'uploading' || phase === 'committing'
+  phase === 'checking' || phase === 'uploading' || phase === 'processing' || phase === 'committing'

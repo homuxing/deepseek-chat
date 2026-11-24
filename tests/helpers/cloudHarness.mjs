@@ -2,7 +2,6 @@ import { readFileSync, readdirSync, mkdirSync, unlinkSync } from 'node:fs'
 import { DatabaseSync } from 'node:sqlite'
 import { pathToFileURL } from 'node:url'
 import { build } from 'esbuild'
-import { installImportStorage } from './importSourceHarness.mjs'
 
 const ENTRY = `
   export { app } from './server/index.ts'
@@ -455,7 +454,6 @@ const isJsonResponse = (response) =>
 /** 每个实例拥有独立 D1、R2、账号、当前身份和请求注入器。 */
 export const createCloudHarness = async () => {
   const modules = await buildCloudTestModules()
-  const importStorage = installImportStorage()
   const db = new LocalD1()
   const files = new LocalR2()
   const sync = createFakeSync()
@@ -489,7 +487,11 @@ export const createCloudHarness = async () => {
     return typeof value === 'string' ? users.find((user) => user.id === value) : value
   }
 
-  const api = async (user, path, { method = 'GET', body, headers = {}, csrf = true } = {}) => {
+  const api = async (
+    user,
+    path,
+    { method = 'GET', body, headers = {}, csrf = true, signal } = {}
+  ) => {
     const account = resolveUser(user)
     if (!path.startsWith('/api/')) {
       throw new Error(`Backend paths must start with /api/: ${path}`)
@@ -519,6 +521,7 @@ export const createCloudHarness = async () => {
         method,
         headers: requestHeaders,
         body: requestBody,
+        signal,
         ...(requestBody instanceof ReadableStream ? { duplex: 'half' } : {}),
       },
       env
@@ -583,6 +586,7 @@ export const createCloudHarness = async () => {
       body: requestBody,
       headers: requestHeaders,
       csrf: false,
+      signal: init.signal,
     })
     const record = {
       path: context.path,
@@ -738,7 +742,7 @@ export const createCloudHarness = async () => {
       return undefined
     }
     if (response.status !== 200) {
-      throw new Error(`Unable to read session ${id}: ${response.status}`)
+      throw new Error(`Unable to read session ${id}: ${response.status} ${await response.text()}`)
     }
     return (await response.json()).session
   }
@@ -778,12 +782,10 @@ export const createCloudHarness = async () => {
       globalThis.fetch = originalFetch
     }
     db.close()
-    importStorage.dispose()
   }
 
   return {
     modules,
-    importStorage,
     db,
     files,
     env,
