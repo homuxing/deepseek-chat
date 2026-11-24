@@ -1,4 +1,12 @@
-import { mkdtempSync, readFileSync, readdirSync, rmSync, statSync, existsSync } from 'node:fs'
+import {
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  readdirSync,
+  rmSync,
+  statSync,
+  existsSync,
+} from 'node:fs'
 import { createRequire } from 'node:module'
 import { extname, join, resolve, sep } from 'node:path'
 import { pathToFileURL } from 'node:url'
@@ -340,7 +348,9 @@ export const loadMiniflareModule = async () => {
 
 export const buildWorkerCloudBundle = async () => {
   buildPromise ??= (async () => {
-    const outputDirectory = mkdtempSync(join(PROJECT_ROOT, 'tmp', 'worker-cloud-e2e-'))
+    // 全新检出不包含被忽略的 tmp，测试准备必须自行创建父目录。
+    mkdirSync(PROJECT_TEMPORARY_ROOT, { recursive: true })
+    const outputDirectory = mkdtempSync(join(PROJECT_TEMPORARY_ROOT, 'worker-cloud-e2e-'))
     const outputFile = join(outputDirectory, 'worker.mjs')
     try {
       await build({
@@ -363,11 +373,19 @@ export const buildWorkerCloudBundle = async () => {
     } catch (error) {
       assertSafeTemporaryDirectory(outputDirectory)
       rmSync(outputDirectory, { recursive: true, force: true })
-      buildPromise = undefined
       throw error
     }
   })()
-  return buildPromise
+  const currentBuild = buildPromise
+  try {
+    return await currentBuild
+  } catch (error) {
+    // 准备失败也清除缓存，清理钩子不重复报告同一错误，后续构建可正常开始。
+    if (buildPromise === currentBuild) {
+      buildPromise = undefined
+    }
+    throw error
+  }
 }
 
 const migrationSnapshot = () =>
@@ -417,13 +435,7 @@ const createStaticAssetsService = (directory) => {
   }
 }
 
-const createMiniflare = async ({
-  outputFile,
-  testSecret,
-  vars,
-  assetsPath,
-  persistentPath,
-}) => {
+const createMiniflare = async ({ outputFile, testSecret, vars, assetsPath, persistentPath }) => {
   const miniflareModule = await loadMiniflareModule()
   const workerOptions = {
     scriptPath: outputFile,
@@ -438,9 +450,7 @@ const createMiniflare = async ({
     durableObjects: {
       SYNC: { className: 'HistorySync', useSQLite: true },
     },
-    ...(assetsPath
-      ? { serviceBindings: { ASSETS: createStaticAssetsService(assetsPath) } }
-      : {}),
+    ...(assetsPath ? { serviceBindings: { ASSETS: createStaticAssetsService(assetsPath) } } : {}),
     ...(persistentPath ? { resourcePersistencePath: persistentPath } : {}),
   }
   const options = miniflareModule.convertV4MiniflareOptions
@@ -483,11 +493,7 @@ const loadWebSocketClass = () => {
   return moduleValue.WebSocket ?? moduleValue
 }
 
-export const createWorkerCloudHarness = async ({
-  vars = {},
-  assetsPath,
-  persistentPath,
-} = {}) => {
+export const createWorkerCloudHarness = async ({ vars = {}, assetsPath, persistentPath } = {}) => {
   const testSecret = `worker-cloud-test-${crypto.randomUUID()}`
   const envVars = {
     ADMIN_USERNAME: 'worker_cloud_admin',
@@ -568,11 +574,7 @@ export const createWorkerCloudHarness = async ({
     return device
   }
 
-  const api = async (
-    account,
-    path,
-    { method = 'GET', body, headers = {}, csrf = true } = {}
-  ) => {
+  const api = async (account, path, { method = 'GET', body, headers = {}, csrf = true } = {}) => {
     if (!path.startsWith('/api/')) {
       throw new Error(`Worker API 路径必须以 /api/ 开头: ${path}`)
     }
@@ -636,9 +638,7 @@ export const createWorkerCloudHarness = async ({
     const settleWaiters = () => {
       for (let index = waiters.length - 1; index >= 0; index--) {
         const waiter = waiters[index]
-        const match = messages
-          .slice(readIndex)
-          .find((message) => message.type === waiter.type)
+        const match = messages.slice(readIndex).find((message) => message.type === waiter.type)
         if (match) {
           readIndex = messages.indexOf(match) + 1
           clearTimeout(waiter.timer)
@@ -648,7 +648,8 @@ export const createWorkerCloudHarness = async ({
       }
     }
     const handleMessage = (event) => {
-      const text = typeof event.data === 'string' ? event.data : new TextDecoder().decode(event.data)
+      const text =
+        typeof event.data === 'string' ? event.data : new TextDecoder().decode(event.data)
       messages.push(JSON.parse(text))
       settleWaiters()
     }
@@ -657,9 +658,7 @@ export const createWorkerCloudHarness = async ({
       closeInfo = {
         code: event.code,
         reason:
-          typeof event.reason === 'string'
-            ? event.reason
-            : new TextDecoder().decode(event.reason),
+          typeof event.reason === 'string' ? event.reason : new TextDecoder().decode(event.reason),
       }
       const error = new Error(`同步连接已关闭: ${event.code} ${event.reason ?? ''}`)
       for (const waiter of waiters.splice(0)) {

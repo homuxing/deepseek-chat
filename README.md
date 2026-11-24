@@ -87,8 +87,8 @@ Password resets, account status updates, and administrator chat cleanup revoke t
 ```sh
 pnpm type
 pnpm lint
-pnpm test
 pnpm build
+pnpm test
 pnpm deploy:dry-run
 ```
 

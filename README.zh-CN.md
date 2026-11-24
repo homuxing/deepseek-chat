@@ -87,8 +87,8 @@ pnpm deploy
 ```sh
 pnpm type
 pnpm lint
-pnpm test
 pnpm build
+pnpm test
 pnpm deploy:dry-run
 ```
 
