@@ -528,9 +528,17 @@ const useHistoryImport = () => {
 }
 
 const historyImportStatus = (progress: HistoryImportProgress): Status => {
+  if (progress.waiting) {
+    return {
+      key: 'historyImportWaiting',
+      params: { sessions: progress.sessions, files: progress.files },
+    }
+  }
   switch (progress.phase) {
     case 'idle':
       return null
+    case 'preparing':
+      return { key: 'historyImportPreparing', params: { percent: progress.preparedPercent ?? 0 } }
     case 'checking':
       return { key: 'historyImportChecking' }
     case 'uploading':

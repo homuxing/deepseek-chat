@@ -278,3 +278,63 @@ test(
 )
 
 test.after(removeWorkerCloudBundle)
+
+test(
+  '真实 Worker 使用固定导入与上传 ID，响应丢失后创建不会留下重复任务',
+  { timeout: 120_000 },
+  async () => {
+    await withHarness(async (harness) => {
+      await harness.initialize()
+      const user = await harness.addAccount('idempotent_import')
+      const starts = await Promise.all(
+        Array.from({ length: 2 }, () =>
+          harness.expectApi(user, '/api/chats/imports', {
+            method: 'POST',
+            body: { id: 'fixed-import' },
+          })
+        )
+      )
+      assert.equal(starts[0].value.id, 'fixed-import')
+      assert.equal(starts[0].value.generation, starts[1].value.generation)
+      const metadata = {
+        kind: 'file',
+        id: 'original',
+        mimeType: 'text/plain',
+        importId: 'fixed-import',
+        uploadId: 'fixed-upload',
+      }
+      const uploads = await Promise.all(
+        Array.from({ length: 2 }, () =>
+          harness.expectApi(user, '/api/storage/uploads', {
+            method: 'POST',
+            body: metadata,
+          })
+        )
+      )
+      assert.equal(uploads[0].value.id, 'fixed-upload')
+      assert.equal(uploads[1].value.id, 'fixed-upload')
+      assert.deepEqual(await harness.query('SELECT COUNT(*) AS n FROM cloud_imports'), [{ n: 1 }])
+      assert.deepEqual(await harness.query('SELECT COUNT(*) AS n FROM cloud_uploads'), [{ n: 1 }])
+      const part = await harness.api(user, '/api/storage/uploads/fixed-upload/parts/1', {
+        method: 'PUT',
+        body: new Blob(['complete-original']),
+      })
+      assert.equal(part.status, 200)
+      const complete = await harness.expectApi(user, '/api/storage/uploads/fixed-upload/complete', {
+        method: 'POST',
+        body: { parts: 1 },
+      })
+      assert.equal(complete.value.file.id, 'original')
+      const reused = await harness.expectApi(user, '/api/storage/uploads', {
+        method: 'POST',
+        body: metadata,
+      })
+      assert.equal(reused.value.id, 'fixed-upload')
+      const invalid = await harness.api(user, '/api/storage/uploads', {
+        method: 'POST',
+        body: { ...metadata, id: 'other-original' },
+      })
+      assert.equal(invalid.status, 409)
+    })
+  }
+)

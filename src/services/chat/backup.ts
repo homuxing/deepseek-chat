@@ -86,25 +86,36 @@ export const importHistory = (file: File): Promise<number> => {
       controller.abort()
     }
   })
-  setHistoryImportProgress({ phase: 'checking', sessions: 0, files: 0 })
+  setHistoryImportProgress({ phase: 'preparing', sessions: 0, files: 0, preparedPercent: 0 })
   return enqueueBackup(async () => {
     assertBackendIdentity(identity)
+    const { prepareImportSource } = await import('./history/importSource.js')
     const { checkArchiveFormat, importArchive } = await import('./history/importArchive.js')
-    await checkArchiveFormat(file)
-    const count = await replaceHistory(async () => {
-      const cloud = await db.createCloudImport(identity, controller.signal)
-      try {
-        setHistoryImportProgress({ phase: 'uploading', sessions: 0, files: 0 })
-        await importArchive(file, cloud.sink)
-        return await cloud.commit()
-      } catch (error) {
-        await cloud.cancel().catch(db.reportStorageError('取消未完成导入'))
-        throw error
-      }
-    }, identity)
-    assertBackendIdentity(identity)
-    setHistoryImportProgress({ phase: 'done', sessions: count })
-    return count
+    const source = await prepareImportSource(file, controller.signal, (bytes) => {
+      setHistoryImportProgress({
+        preparedPercent: file.size ? Math.floor((bytes / file.size) * 100) : 100,
+      })
+    })
+    try {
+      setHistoryImportProgress({ phase: 'checking' })
+      await checkArchiveFormat(source.file)
+      const count = await replaceHistory(async () => {
+        const cloud = await db.createCloudImport(identity, controller.signal)
+        try {
+          setHistoryImportProgress({ phase: 'uploading', sessions: 0, files: 0 })
+          await importArchive(source.file, cloud.sink)
+          return await cloud.commit()
+        } catch (error) {
+          await cloud.cancel().catch(db.reportStorageError('取消未完成导入'))
+          throw error
+        }
+      }, identity)
+      assertBackendIdentity(identity)
+      setHistoryImportProgress({ phase: 'done', sessions: count })
+      return count
+    } finally {
+      await source.dispose().catch(db.reportStorageError('清理导入文件副本'))
+    }
   })
     .catch((error: unknown) => {
       setHistoryImportProgress({

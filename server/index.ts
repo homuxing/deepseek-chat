@@ -82,7 +82,7 @@ app.use('/api/*', async (c, next) => {
         chunks.push(result.value)
       }
     } catch {
-      return c.json({ error: { message: '上传连接已中断' } }, 400)
+      return c.json({ error: { message: '上传连接已中断' } }, 408)
     } finally {
       reader.releaseLock()
     }

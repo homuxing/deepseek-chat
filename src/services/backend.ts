@@ -75,6 +75,14 @@ export class BackendError extends Error {
   }
 }
 
+/** 仅标记 fetch 与响应读取阶段的传输失败，避免把程序 TypeError 当成断网恢复。 */
+export class BackendConnectionError extends TypeError {
+  constructor(error: TypeError) {
+    super(error.message, { cause: error })
+    this.name = 'BackendConnectionError'
+  }
+}
+
 export const backendResponseError = async (response: Response): Promise<BackendError> =>
   new BackendError(await errorMessage(response), response.status)
 
@@ -133,7 +141,12 @@ export const backendFetch = async (
     headers,
     credentials: 'same-origin',
   }
-  const response = await fetch(path, requestInit as RequestInit)
+  let response: Response
+  try {
+    response = await fetch(path, requestInit as RequestInit)
+  } catch (error) {
+    throw error instanceof TypeError ? new BackendConnectionError(error) : error
+  }
   if (identity) {
     assertBackendIdentity(identity)
   }
@@ -156,7 +169,12 @@ export const apiJson = async <T>(
   if (response.status === 204) {
     return undefined as T
   }
-  const text = await response.text()
+  let text: string
+  try {
+    text = await response.text()
+  } catch (error) {
+    throw error instanceof TypeError ? new BackendConnectionError(error) : error
+  }
   if (identity) {
     assertBackendIdentity(identity)
   }

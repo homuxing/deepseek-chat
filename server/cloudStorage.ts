@@ -1200,18 +1200,35 @@ cloudStorageRoutes.get('/chats/imports/:id', async (c) => {
 
 cloudStorageRoutes.post('/chats/imports', async (c) => {
   const user = c.get('user')
+  let body: unknown
+  try {
+    body = await readJson(c.req.raw)
+  } catch {
+    return errorResponse('请求内容不是有效 JSON')
+  }
+  if (!isRecord(body) || (body.id !== undefined && !isValidId(body.id))) {
+    return errorResponse('导入任务 ID 无效')
+  }
   const active = await ensureActiveHistory(c.env, user.id)
-  const id = crypto.randomUUID()
+  const id = typeof body.id === 'string' ? body.id : crypto.randomUUID()
   const generation = `import_${crypto.randomUUID().replaceAll('-', '')}`
   const now = Date.now()
   await c.env.DB.prepare(
     `INSERT INTO cloud_imports
        (user_id, id, generation, base_revision, status, count, created_at, updated_at)
-     VALUES (?, ?, ?, ?, 'staging', 0, ?, ?)`
+     VALUES (?, ?, ?, ?, 'staging', 0, ?, ?)
+     ON CONFLICT(user_id, id) DO NOTHING`
   )
     .bind(user.id, id, generation, active.revision, now, now)
     .run()
-  return jsonResponse({ id, generation, revision: active.revision }, 201)
+  const imported = await getImport(c.env, user.id, id)
+  if (!imported || imported.status !== 'staging') {
+    return errorResponse('导入任务已经结束', 409)
+  }
+  return jsonResponse(
+    { id, generation: imported.generation, revision: imported.base_revision },
+    201
+  )
 })
 
 cloudStorageRoutes.delete('/chats/imports/:id', async (c) => {
@@ -1474,7 +1491,23 @@ cloudStorageRoutes.post('/storage/uploads', async (c) => {
     mimeType = body.mimeType.trim()
   }
 
-  const uploadId = crypto.randomUUID()
+  if (body.uploadId !== undefined && (importId === null || !isValidId(body.uploadId))) {
+    return errorResponse('上传任务 ID 无效')
+  }
+  const uploadId = typeof body.uploadId === 'string' ? body.uploadId : crypto.randomUUID()
+  const existing = await findUpload(c.env, user.id, uploadId)
+  if (existing) {
+    if (
+      existing.kind !== body.kind ||
+      existing.object_id !== body.id ||
+      existing.import_id !== importId ||
+      existing.mime_type !== mimeType ||
+      !['uploading', 'completed'].includes(existing.status)
+    ) {
+      return errorResponse('上传任务内容或状态不一致', 409)
+    }
+    return jsonResponse({ id: uploadId }, 201)
+  }
   const key = `${user.id}/uploads/${uploadId}`
   const multipart = await c.env.FILES.createMultipartUpload(key, {
     httpMetadata: {
@@ -1491,7 +1524,8 @@ cloudStorageRoutes.post('/storage/uploads', async (c) => {
        WHERE ? IS NULL OR EXISTS (
          SELECT 1 FROM cloud_imports
          WHERE user_id = ? AND id = ? AND generation = ? AND status = 'staging'
-       )`
+       )
+       ON CONFLICT(user_id, id) DO NOTHING`
     )
       .bind(
         user.id,
@@ -1516,6 +1550,17 @@ cloudStorageRoutes.post('/storage/uploads', async (c) => {
       .run()
     if (inserted.meta.changes === 0) {
       await multipart.abort()
+      const current = await findUpload(c.env, user.id, uploadId)
+      if (
+        current &&
+        current.kind === body.kind &&
+        current.object_id === body.id &&
+        current.import_id === importId &&
+        current.mime_type === mimeType &&
+        current.status === 'uploading'
+      ) {
+        return jsonResponse({ id: uploadId }, 201)
+      }
       return errorResponse('导入任务已经结束，无法创建上传', 409)
     }
   } catch (error) {
@@ -1560,7 +1605,7 @@ cloudStorageRoutes.put('/storage/uploads/:id/parts/:part', async (c) => {
       return errorResponse('上传任务状态已变化', 409)
     }
     if (c.req.raw.signal.aborted || (error instanceof Error && error.name === 'AbortError')) {
-      return errorResponse('上传连接已中断', 400)
+      return errorResponse('上传连接已中断', 408)
     }
     throw error
   }

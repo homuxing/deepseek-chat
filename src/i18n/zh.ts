@@ -98,6 +98,9 @@ export const zh = {
   backupNewerVersion: '文件版本过新，请升级后再导入',
   backupInvalidVersion: '文件版本无效，无法导入',
   backupIncomplete: '文件内容不完整，无法导入',
+  backupSourceUnavailable: '无法继续读取选中的 ZIP 文件，请确认文件已完整下载且仍保存在本机。',
+  backupStorageUnavailable: '当前浏览器无法保存导入文件，请使用支持文件存储的浏览器。',
+  backupStorageFull: '保存导入文件的空间不足，请释放本机空间后重新导入。',
   backupInvalidBranches: '文件中的消息分支已损坏，无法导入',
   backupInvalidFiles: '文件中的附件数据已损坏，无法导入',
   settingsLocalePreference: '语言',
@@ -137,6 +140,8 @@ export const zh = {
   historyImportDescription:
     '导入会覆盖账号中保存的全部历史对话和附件，并同步到其他已登录设备。支持 DeepSeek 导出的 ZIP 文件。',
   historyImportChecking: '正在检查导入文件',
+  historyImportPreparing: '正在准备导入文件：{percent}%',
+  historyImportWaiting: '连接暂时中断，正在自动恢复。已上传 {sessions} 个对话、{files} 个附件。',
   historyImportInProgress: '正在导入历史对话',
   historyImportErrorTitle: '导入未完成',
   historyImportKeepOpen: '请保持页面打开并保持网络连接，等待导入完成。',

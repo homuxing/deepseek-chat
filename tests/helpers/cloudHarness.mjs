@@ -2,6 +2,7 @@ import { readFileSync, readdirSync, mkdirSync, unlinkSync } from 'node:fs'
 import { DatabaseSync } from 'node:sqlite'
 import { pathToFileURL } from 'node:url'
 import { build } from 'esbuild'
+import { installImportStorage } from './importSourceHarness.mjs'
 
 const ENTRY = `
   export { app } from './server/index.ts'
@@ -12,6 +13,7 @@ const ENTRY = `
   export * as store from './src/services/chat/store.ts'
   export * as backend from './src/services/backend.ts'
   export * as importProgress from './src/services/chat/importProgress.ts'
+  export * as importTransport from './src/services/chat/importTransport.ts'
   export * as schema from './src/services/chat/history/schema.ts'
   export * as paths from './src/services/chat/history/paths.ts'
   export { toLocalSession } from './src/services/chat/history/toLocal.ts'
@@ -453,6 +455,7 @@ const isJsonResponse = (response) =>
 /** 每个实例拥有独立 D1、R2、账号、当前身份和请求注入器。 */
 export const createCloudHarness = async () => {
   const modules = await buildCloudTestModules()
+  const importStorage = installImportStorage()
   const db = new LocalD1()
   const files = new LocalR2()
   const sync = createFakeSync()
@@ -775,10 +778,12 @@ export const createCloudHarness = async () => {
       globalThis.fetch = originalFetch
     }
     db.close()
+    importStorage.dispose()
   }
 
   return {
     modules,
+    importStorage,
     db,
     files,
     env,

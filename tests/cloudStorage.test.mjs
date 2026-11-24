@@ -48,7 +48,7 @@ test('分片读取中断返回明确错误，取消导入同时清理所属上�
       method: 'PUT',
       body: new Blob(['incomplete']),
     })
-    assert.equal(part.status, 400)
+    assert.equal(part.status, 408)
     assert.match((await part.json()).error.message, /中断/)
     for (let attempt = 0; attempt < 2; attempt++) {
       assert.equal(
@@ -65,7 +65,7 @@ test('分片读取中断返回明确错误，取消导入同时清理所属上�
   })
 })
 
-test('请求正文流截断返回 400，真实存储失败如实返回 500', async () => {
+test('请求正文流截断返回 408，真实存储失败如实返回 500', async () => {
   await withHarness(async (harness) => {
     const user = await harness.addUser('stream_disconnect')
     const start = await harness.api(user, '/api/storage/uploads', {
@@ -79,7 +79,7 @@ test('请求正文流截断返回 400，真实存储失败如实返回 500', asy
       },
     })
     const failed = await harness.api(user, `${path}/parts/1`, { method: 'PUT', body: disconnected })
-    assert.equal(failed.status, 400)
+    assert.equal(failed.status, 408)
     assert.match((await failed.json()).error.message, /上传连接已中断/)
     const oversized = await harness.api(user, `${path}/parts/1`, {
       method: 'PUT',

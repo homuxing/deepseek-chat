@@ -1,12 +1,21 @@
 import { create } from 'zustand'
 
-export type HistoryImportPhase = 'idle' | 'checking' | 'uploading' | 'committing' | 'done' | 'error'
+export type HistoryImportPhase =
+  | 'idle'
+  | 'preparing'
+  | 'checking'
+  | 'uploading'
+  | 'committing'
+  | 'done'
+  | 'error'
 
 export type HistoryImportProgress = {
   phase: HistoryImportPhase
   sessions: number
   files: number
   error?: string
+  preparedPercent?: number
+  waiting?: boolean
 }
 
 const createInitialState = (): HistoryImportProgress => ({
@@ -28,6 +37,12 @@ export const setHistoryImportProgress = (progress: Partial<HistoryImportProgress
     if (progress.phase && progress.phase !== 'error') {
       delete next.error
     }
+    if (progress.phase && progress.phase !== 'preparing') {
+      delete next.preparedPercent
+    }
+    if (progress.waiting === undefined) {
+      delete next.waiting
+    }
     return next
   }, true)
 }
@@ -37,4 +52,4 @@ export const resetHistoryImportProgress = (): void => {
 }
 
 export const isHistoryImportActive = (phase: HistoryImportPhase): boolean =>
-  phase === 'checking' || phase === 'uploading' || phase === 'committing'
+  phase === 'preparing' || phase === 'checking' || phase === 'uploading' || phase === 'committing'

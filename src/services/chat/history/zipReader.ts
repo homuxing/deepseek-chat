@@ -1,4 +1,5 @@
 import { Inflate } from 'fflate'
+import { sourceReadError } from './importSource.js'
 
 const READ_CHUNK_BYTES = 256 * 1024
 // 控制每轮同步解压的工作量；输出交给调用方保存后才继续读取。
@@ -22,7 +23,7 @@ const invalid = (): never => {
 
 /** 本地文件头签名 PK\x03\x04，用于在解析前区分 ZIP 与其他文件。 */
 export const isZipFile = async (file: File) => {
-  const bytes = new Uint8Array(await file.slice(0, 4).arrayBuffer())
+  const bytes = await readBytes(file, 0, Math.min(4, file.size))
   return bytes.length === 4 && bytes.every((byte, index) => byte === [0x50, 0x4b, 3, 4][index])
 }
 
@@ -54,7 +55,13 @@ const readBytes = async (file: File, start: number, length: number) => {
   ) {
     invalid()
   }
-  const bytes = new Uint8Array(await file.slice(start, start + length).arrayBuffer())
+  let buffer: ArrayBuffer
+  try {
+    buffer = await file.slice(start, start + length).arrayBuffer()
+  } catch (error) {
+    throw sourceReadError(error)
+  }
+  const bytes = new Uint8Array(buffer)
   if (bytes.length !== length) {
     invalid()
   }

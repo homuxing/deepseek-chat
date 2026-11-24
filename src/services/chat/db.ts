@@ -9,6 +9,11 @@ import {
   type BackendIdentity,
 } from '../backend.js'
 import { setHistoryImportProgress } from './importProgress.js'
+import {
+  isImportConnectionError,
+  recoverImportConnection,
+  waitForImportConnection,
+} from './importTransport.js'
 import { toSessionSummary, type Session, type SessionSummary } from './types.js'
 import type { ArchiveImportSink } from './history/importArchive.js'
 
@@ -79,15 +84,21 @@ const uploadObject = async (
   signal?: AbortSignal
 ): Promise<UploadResult> => {
   assertBackendIdentity(identity)
-  const started = await apiJson<{ id: string }>(
-    '/api/storage/uploads',
-    {
-      method: 'POST',
-      headers: jsonHeaders,
-      body: JSON.stringify(metadata),
-      signal,
-    },
-    identity
+  const importing = typeof metadata.importId === 'string' && signal
+  const connect = <T>(run: () => Promise<T>): Promise<T> =>
+    importing ? recoverImportConnection(run, identity, signal) : run()
+  const uploadId = importing ? crypto.randomUUID() : undefined
+  const started = await connect(() =>
+    apiJson<{ id: string }>(
+      '/api/storage/uploads',
+      {
+        method: 'POST',
+        headers: jsonHeaders,
+        body: JSON.stringify({ ...metadata, ...(uploadId ? { uploadId } : {}) }),
+        signal,
+      },
+      identity
+    )
   )
   if (!started?.id) {
     throw new Error('无法确认上传任务已创建')
@@ -98,41 +109,60 @@ const uploadObject = async (
     const parts = Math.max(1, Math.ceil(blob.size / CHUNK_BYTES))
     for (let part = 1; part <= parts; part++) {
       assertBackendIdentity(identity)
-      const response = await backendFetch(
-        path + '/parts/' + part,
-        {
-          method: 'PUT',
-          body: blob.slice((part - 1) * CHUNK_BYTES, part * CHUNK_BYTES),
-          signal,
-        },
-        identity
-      )
-      if (!response.ok) {
-        throw await backendResponseError(response)
-      }
+      const chunk = blob.slice((part - 1) * CHUNK_BYTES, part * CHUNK_BYTES)
+      await connect(async () => {
+        const response = await backendFetch(
+          path + '/parts/' + part,
+          {
+            method: 'PUT',
+            body: chunk,
+            signal,
+          },
+          identity
+        )
+        if (!response.ok) {
+          throw await backendResponseError(response)
+        }
+      })
     }
     let result: UploadResult
-    try {
-      result = await apiJson<UploadResult>(
-        path + '/complete',
-        {
-          method: 'POST',
-          headers: jsonHeaders,
-          body: JSON.stringify({ parts }),
-          signal,
-        },
-        identity
-      )
-    } catch (error) {
-      assertBackendIdentity(identity)
-      if (signal?.aborted) {
-        throw error
+    for (let attempt = 0; ; attempt++) {
+      try {
+        result = await apiJson<UploadResult>(
+          path + '/complete',
+          {
+            method: 'POST',
+            headers: jsonHeaders,
+            body: JSON.stringify({ parts }),
+            signal,
+          },
+          identity
+        )
+        break
+      } catch (error) {
+        assertBackendIdentity(identity)
+        if (signal?.aborted) {
+          throw error
+        }
+        let status = await connect(() =>
+          apiJson<UploadResult & { status?: string }>(path, {}, identity)
+        )
+        // 完成响应不确定时读取既有任务，完成中的任务只等待其结果。
+        while (importing && status.status === 'completing' && isImportConnectionError(error)) {
+          await waitForImportConnection(identity, signal, attempt++)
+          status = await connect(() =>
+            apiJson<UploadResult & { status?: string }>(path, {}, identity)
+          )
+        }
+        if (status.status === 'completed') {
+          result = status
+          break
+        }
+        if (!importing || status.status !== 'uploading' || !isImportConnectionError(error)) {
+          throw error
+        }
+        await waitForImportConnection(identity, signal, attempt)
       }
-      const status = await apiJson<UploadResult & { status?: string }>(path, {}, identity)
-      if (status.status !== 'completed') {
-        throw error
-      }
-      result = status
     }
     if (!result || typeof result !== 'object') {
       throw new Error('无法确认上传内容已保存')
@@ -313,15 +343,19 @@ export const deleteStoredFile = deleteFile
 export const createCloudImport = async (identity: BackendIdentity, signal: AbortSignal) => {
   await waitForStorageWrites()
   assertBackendIdentity(identity)
-  const started = await apiJson<{ id: string; generation: string; revision: number }>(
-    '/api/chats/imports',
-    {
-      method: 'POST',
-      headers: jsonHeaders,
-      body: '{}',
-      signal,
-    },
-    identity
+  const connect = <T>(run: () => Promise<T>) => recoverImportConnection(run, identity, signal)
+  const requestedId = crypto.randomUUID()
+  const started = await connect(() =>
+    apiJson<{ id: string; generation: string; revision: number }>(
+      '/api/chats/imports',
+      {
+        method: 'POST',
+        headers: jsonHeaders,
+        body: JSON.stringify({ id: requestedId }),
+        signal,
+      },
+      identity
+    )
   )
   if (!started?.id) {
     throw new Error('无法确认导入任务已创建')
@@ -382,33 +416,42 @@ export const createCloudImport = async (identity: BackendIdentity, signal: Abort
       assertBackendIdentity(identity)
       setHistoryImportProgress({ phase: 'committing', sessions, files })
       let result: { generation: string; revision: number; count: number }
-      try {
-        result = await apiJson(
-          path + '/commit',
-          {
-            method: 'POST',
-            headers: jsonHeaders,
-            body: JSON.stringify({ count: sessions }),
-            signal,
-          },
-          identity
-        )
-      } catch (error) {
-        // 响应丢失后只查询任务结果，不重复提交覆盖操作。
-        assertBackendIdentity(identity)
-        if (signal.aborted) {
-          throw error
+      for (let attempt = 0; ; attempt++) {
+        try {
+          result = await apiJson(
+            path + '/commit',
+            {
+              method: 'POST',
+              headers: jsonHeaders,
+              body: JSON.stringify({ count: sessions }),
+              signal,
+            },
+            identity
+          )
+          break
+        } catch (error) {
+          // 响应丢失后先确认任务；只在尚未提交时恢复同一幂等提交。
+          assertBackendIdentity(identity)
+          if (signal.aborted) {
+            throw error
+          }
+          const status = await connect(() =>
+            apiJson<{
+              status: string
+              generation: string
+              revision: number
+              count: number
+            }>(path, {}, identity)
+          )
+          if (status.status === 'committed') {
+            result = status
+            break
+          }
+          if (status.status !== 'staging' || !isImportConnectionError(error)) {
+            throw error
+          }
+          await waitForImportConnection(identity, signal, attempt)
         }
-        const status = await apiJson<{
-          status: string
-          generation: string
-          revision: number
-          count: number
-        }>(path, {}, identity)
-        if (status.status !== 'committed') {
-          throw error
-        }
-        result = status
       }
       if (!result || result.count !== sessions) {
         throw new Error('无法确认完整历史已保存')
@@ -417,7 +460,7 @@ export const createCloudImport = async (identity: BackendIdentity, signal: Abort
       rememberVersion(result)
       savedVersions.clear()
       try {
-        return (await loadHistorySnapshot(identity)).sessions
+        return (await connect(() => loadHistorySnapshot(identity))).sessions
       } catch (error) {
         throw new Error(
           '历史已保存至云端，但读取更新失败：' +

@@ -103,6 +103,12 @@ export const en = {
   backupNewerVersion: 'This file uses a newer version. Please update the app before importing.',
   backupInvalidVersion: 'The file version is invalid and cannot be imported.',
   backupIncomplete: 'The file is incomplete and cannot be imported.',
+  backupSourceUnavailable:
+    'The selected ZIP can no longer be read. Make sure it is fully downloaded and still available on this device.',
+  backupStorageUnavailable:
+    'This browser cannot save the import file. Please use a browser that supports file storage.',
+  backupStorageFull:
+    'There is not enough space to save the import file. Free up space on this device before importing again.',
   backupInvalidBranches: 'The message branches in this file are corrupted and cannot be imported.',
   backupInvalidFiles: 'The attachment data in this file is corrupted and cannot be imported.',
   settingsLocalePreference: 'Language',
@@ -144,6 +150,9 @@ export const en = {
   historyImportDescription:
     'Importing replaces all chat history and attachments saved in your account and syncs the result to your other signed-in devices. Supports ZIP files exported from DeepSeek.',
   historyImportChecking: 'Checking import file...',
+  historyImportPreparing: 'Preparing import file: {percent}%',
+  historyImportWaiting:
+    'The connection was interrupted. Reconnecting automatically. Uploaded {sessions} conversations and {files} attachments.',
   historyImportInProgress: 'Importing chat history',
   historyImportErrorTitle: 'Import incomplete',
   historyImportKeepOpen: 'Keep this page open and stay connected until the import finishes.',

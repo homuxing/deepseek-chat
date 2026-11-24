@@ -37,7 +37,11 @@ test('导入全过程绑定离开页面提醒，失败后移除提醒并保留�
     })
     const rejectPart = harness.intercept((request) => {
       if (request.method === 'PUT' && /\/parts\/1$/.test(request.path)) {
-        return { error: new TypeError('网络连接已中断') }
+        return {
+          response: new Response(JSON.stringify({ error: { message: '文件内容无效' } }), {
+            status: 400,
+          }),
+        }
       }
     })
     try {
@@ -45,7 +49,7 @@ test('导入全过程绑定离开页面提醒，失败后移除提醒并保留�
       const leaving = new Event('beforeunload', { cancelable: true })
       page.dispatchEvent(leaving)
       assert.equal(leaving.defaultPrevented, true)
-      await assert.rejects(importing, /网络连接已中断/)
+      await assert.rejects(importing, /文件内容无效/)
       const afterFailure = new Event('beforeunload', { cancelable: true })
       page.dispatchEvent(afterFailure)
       assert.equal(afterFailure.defaultPrevented, false)
@@ -71,6 +75,255 @@ test('导入全过程绑定离开页面提醒，失败后移除提醒并保留�
   })
 })
 
+test('上传开始后原 ZIP 不可读取，完整副本仍能完成后续对话和附件导入', async () => {
+  await withHarness(async (harness) => {
+    const { modules } = harness
+    const user = await harness.addUser('stable_source')
+    harness.setCurrentUser(user, { reset: true })
+    const attachment = fileReference(modules, {
+      sessionId: 'source-next',
+      id: 'stable-original',
+      name: 'stable.txt',
+      fileName: 'stable.txt',
+      bytes: new TextEncoder().encode('完整附件'),
+      isImage: false,
+    })
+    const source = toFile(
+      await buildArchive(modules, {
+        sessions: [
+          makeSession({ id: 'source-first' }),
+          makeSession({ id: 'source-next', files: [attachment.entry] }),
+        ],
+        originals: [attachment.original],
+      })
+    )
+    let unavailable = false
+    const slice = source.slice.bind(source)
+    source.slice = (...args) => {
+      if (unavailable) throw new DOMException('源文件已丢失', 'NotFoundError')
+      return slice(...args)
+    }
+    source.stream = () => {
+      if (unavailable) throw new DOMException('源文件已丢失', 'NotFoundError')
+      return Blob.prototype.stream.call(source)
+    }
+    const stop = modules.importProgress.useHistoryImportProgress.subscribe((state) => {
+      if (state.sessions === 1) unavailable = true
+    })
+    try {
+      assert.equal(await modules.backup.importHistory(source), 2)
+      assert.equal(unavailable, true)
+      assert.equal(modules.importProgress.useHistoryImportProgress.getState().files, 1)
+      assert.equal(harness.importStorage.files.size, 0)
+      assert.deepEqual(
+        (await harness.snapshotAs(user)).sessions.map((session) => session.id).sort(),
+        ['source-first', 'source-next']
+      )
+    } finally {
+      stop()
+    }
+  })
+})
+
+test('源 ZIP 在准备期间读取失败，未创建云端任务且副本完整清理', async () => {
+  await withHarness(async (harness) => {
+    const { modules } = harness
+    const user = await harness.addUser('unreadable_source')
+    harness.setCurrentUser(user, { reset: true })
+    const source = toFile(new Uint8Array(100))
+    source.stream = () =>
+      new ReadableStream({
+        start(controller) {
+          controller.enqueue(new Uint8Array(4))
+        },
+        pull(controller) {
+          controller.error(new DOMException('源文件已丢失', 'NotFoundError'))
+        },
+      })
+    await assert.rejects(modules.backup.importHistory(source), /无法继续读取/)
+    assert.equal(harness.importStorage.files.size, 0)
+    assert.equal(
+      harness.requests.some((request) => request.method === 'POST'),
+      false
+    )
+    const valid = await buildArchive(modules, { sessions: [makeSession({ id: 'readable-again' })] })
+    assert.equal(await modules.backup.importHistory(toFile(valid)), 1)
+  })
+})
+
+test('副本写入空间不足时保留旧历史，清理副本并准确报告原因', async () => {
+  await withHarness(async (harness) => {
+    const { modules } = harness
+    const user = await harness.addUser('copy_quota')
+    harness.setCurrentUser(user, { reset: true })
+    harness.importStorage.state.beforeWrite = () => {
+      throw new DOMException('空间不足', 'QuotaExceededError')
+    }
+    const archive = await buildArchive(modules, { sessions: [makeSession({ id: 'quota-source' })] })
+    await assert.rejects(modules.backup.importHistory(toFile(archive)), /空间不足/)
+    assert.equal(harness.importStorage.files.size, 0)
+    assert.equal(
+      harness.requests.some((request) => request.method === 'POST'),
+      false
+    )
+    harness.importStorage.state.beforeWrite = undefined
+    assert.equal(await modules.backup.importHistory(toFile(archive)), 1)
+  })
+})
+
+test('副本准备期间切换账号取消读取与写入，不创建云端任务', async () => {
+  await withHarness(async (harness) => {
+    const { modules } = harness
+    const user = await harness.addUser('copy_account')
+    const other = await harness.addUser('copy_other')
+    harness.setCurrentUser(user, { reset: true })
+    const gate = harness.gate()
+    harness.importStorage.state.beforeWrite = async () => {
+      gate.markEntered()
+      await gate.wait
+    }
+    const archive = await buildArchive(modules, { sessions: [makeSession({ id: 'copy-aborted' })] })
+    const importing = modules.backup.importHistory(toFile(archive))
+    await gate.entered
+    harness.setCurrentUser(other, { reset: true })
+    gate.release()
+    await assert.rejects(importing, /abort|取消/i)
+    assert.equal(harness.importStorage.files.size, 0)
+    assert.equal(
+      harness.requests.some((request) => request.method === 'POST'),
+      false
+    )
+  })
+})
+
+test('导入仅恢复传输失败与临时状态，程序错误和永久失败如实报告', async () => {
+  await withHarness(async (harness) => {
+    const { backend, importTransport } = harness.modules
+    assert.equal(importTransport.isImportConnectionError(new TypeError('程序错误')), false)
+    assert.equal(
+      importTransport.isImportConnectionError(new DOMException('源文件不可读', 'NotFoundError')),
+      false
+    )
+    assert.equal(
+      importTransport.isImportConnectionError(
+        new backend.BackendConnectionError(new TypeError('连接中断'))
+      ),
+      true
+    )
+    for (const status of [408, 429, 502, 503, 504]) {
+      assert.equal(
+        importTransport.isImportConnectionError(new backend.BackendError('临时失败', status)),
+        true
+      )
+    }
+    for (const status of [400, 401, 403, 404, 409, 413, 500]) {
+      assert.equal(
+        importTransport.isImportConnectionError(new backend.BackendError('永久失败', status)),
+        false
+      )
+    }
+  })
+})
+
+test('创建响应丢失、分片连接中断及完成前断网均自动恢复同一任务', async () => {
+  await withHarness(async (harness) => {
+    const { modules } = harness
+    const user = await harness.addUser('connection_resume')
+    harness.setCurrentUser(user, { reset: true })
+    const failures = new Set()
+    const waits = []
+    const unsubscribe = modules.importProgress.useHistoryImportProgress.subscribe((state) => {
+      if (state.waiting) waits.push({ sessions: state.sessions, files: state.files })
+    })
+    const archive = await buildArchive(modules, {
+      sessions: [makeSession({ id: 'resume-first' }), makeSession({ id: 'resume-next' })],
+    })
+    harness.intercept((request) => {
+      const key =
+        request.path === '/api/chats/imports'
+          ? 'import-start'
+          : request.path === '/api/storage/uploads'
+            ? 'upload-start'
+            : /\/parts\/1$/.test(request.path)
+              ? 'part'
+              : /\/complete$/.test(request.path)
+                ? 'complete'
+                : /\/commit$/.test(request.path)
+                  ? 'commit'
+                  : undefined
+      if (!key || failures.has(key)) return
+      failures.add(key)
+      const failure = new TypeError('连接已中断')
+      if (key.endsWith('start'))
+        return {
+          afterResponse() {
+            throw failure
+          },
+        }
+      return { error: failure }
+    })
+    try {
+      assert.equal(await modules.backup.importHistory(toFile(archive)), 2)
+      assert.equal(waits.length >= 5, true)
+      assert.equal(harness.db.db.prepare('SELECT COUNT(*) AS n FROM cloud_imports').get().n, 1)
+      assert.equal(harness.db.db.prepare('SELECT COUNT(*) AS n FROM cloud_uploads').get().n, 2)
+      assert.equal(
+        harness.requests.some((request) => request.method === 'DELETE'),
+        false
+      )
+      assert.equal(harness.importStorage.files.size, 0)
+      assert.equal(modules.importProgress.useHistoryImportProgress.getState().waiting, undefined)
+    } finally {
+      unsubscribe()
+    }
+  })
+})
+
+test('断网等待期间保留进度和离开提醒，联网后继续且账号变化可结束等待', async () => {
+  await withHarness(async (harness) => {
+    const { modules } = harness
+    const user = await harness.addUser('waiting_user')
+    const other = await harness.addUser('waiting_other')
+    harness.setCurrentUser(user, { reset: true })
+    const previousWindow = globalThis.window
+    const page = new EventTarget()
+    globalThis.window = page
+    let disconnected = true
+    harness.intercept((request) => {
+      if (disconnected && request.method === 'PUT') return { error: new TypeError('连接中断') }
+    })
+    const archive = await buildArchive(modules, { sessions: [makeSession({ id: 'wait-resume' })] })
+    try {
+      const importing = modules.backup.importHistory(toFile(archive))
+      await harness.waitUntil(
+        () => modules.importProgress.useHistoryImportProgress.getState().waiting
+      )
+      const leaving = new Event('beforeunload', { cancelable: true })
+      page.dispatchEvent(leaving)
+      assert.equal(leaving.defaultPrevented, true)
+      assert.equal(harness.files.multipartUploads.size, 1)
+      disconnected = false
+      page.dispatchEvent(new Event('online'))
+      assert.equal(await importing, 1)
+      disconnected = true
+      const cancelled = modules.backup.importHistory(toFile(archive))
+      await harness.waitUntil(
+        () => modules.importProgress.useHistoryImportProgress.getState().waiting
+      )
+      harness.setCurrentUser(other, { reset: true })
+      await assert.rejects(cancelled, /账号已变更|取消/)
+      assert.equal(harness.importStorage.files.size, 0)
+      const after = new Event('beforeunload', { cancelable: true })
+      page.dispatchEvent(after)
+      assert.equal(after.defaultPrevented, false)
+      assert.equal(mutationRequests(harness, other).length, 0)
+    } finally {
+      if (previousWindow === undefined) delete globalThis.window
+      else globalThis.window = previousWindow
+    }
+  })
+})
+
 test('提交成功后读取列表失败明确报告已保存，不再取消已提交任务', async () => {
   await withHarness(async (harness) => {
     const { modules } = harness
@@ -90,7 +343,11 @@ test('提交成功后读取列表失败明确报告已保存，不再取消已�
         }
       }
       if (committed && request.method === 'GET' && request.path === '/api/chats') {
-        return { error: new TypeError('网络连接已中断') }
+        return {
+          response: new Response(JSON.stringify({ error: { message: '读取更新不可用' } }), {
+            status: 500,
+          }),
+        }
       }
     })
     await assert.rejects(
@@ -297,7 +554,10 @@ test('235 个会话、超过 1 MiB 的归档和超过 900 KiB 的会话逐条完
     unsubscribe()
     assert.equal(imported, 235)
     const progress = modules.importProgress.useHistoryImportProgress.getState()
-    assert.deepEqual(new Set(phases), new Set(['checking', 'uploading', 'committing', 'done']))
+    assert.deepEqual(
+      new Set(phases),
+      new Set(['preparing', 'checking', 'uploading', 'committing', 'done'])
+    )
     assert.equal(progress.phase, 'done')
     assert.equal(progress.sessions, 235)
     assert.equal(progress.files, 2)

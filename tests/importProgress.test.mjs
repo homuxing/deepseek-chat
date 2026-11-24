@@ -31,7 +31,7 @@ const {
 after(resetHistoryImportProgress)
 
 test('检查、上传和提交期间禁止关闭设置，结束后恢复关闭', () => {
-  for (const phase of ['checking', 'uploading', 'committing']) {
+  for (const phase of ['preparing', 'checking', 'uploading', 'committing']) {
     setHistoryImportProgress({ phase })
     openSettings('data')
     closeSettings()
@@ -96,4 +96,20 @@ test('成功状态保留计数，重置后清除全部导入状态', () => {
     files: 0,
   })
   assert.equal(isHistoryImportActive(useHistoryImportProgress.getState().phase), false)
+})
+
+test('准备进度与断网等待属于进行状态，完成后清除临时状态', () => {
+  setHistoryImportProgress({ phase: 'preparing', preparedPercent: 35, sessions: 0, files: 0 })
+  assert.equal(isHistoryImportActive('preparing'), true)
+  setHistoryImportProgress({ phase: 'uploading', sessions: 3, files: 2, waiting: true })
+  assert.equal(useHistoryImportProgress.getState().preparedPercent, undefined)
+  assert.equal(useHistoryImportProgress.getState().waiting, true)
+  openSettings('data')
+  closeSettings()
+  assert.equal(useSettingsDialog.getState().open, true)
+  setHistoryImportProgress({ waiting: undefined })
+  assert.equal(useHistoryImportProgress.getState().waiting, undefined)
+  assert.equal(useHistoryImportProgress.getState().sessions, 3)
+  resetHistoryImportProgress()
+  closeSettings()
 })
