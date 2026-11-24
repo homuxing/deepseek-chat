@@ -2,7 +2,9 @@ import { Hono, type Context } from 'hono'
 import { HTTPException } from 'hono/http-exception'
 import {
   assertApiKeyEncryptionConfigured,
+  decryptInviteCode,
   encryptApiKey,
+  encryptInviteCode,
   hashPassword,
   randomToken,
   sha256,
@@ -72,6 +74,7 @@ type AdminUserRow = {
 type InviteRow = {
   id: string
   code_hash: string
+  code_ciphertext: string | null
   max_uses: number
   uses: number
   expires_at: number | null
@@ -779,21 +782,23 @@ adminRoutes.post('/invites', async (c) => {
   const id = crypto.randomUUID()
   const code = randomToken()
   const codeHash = await sha256(code)
+  const codeCiphertext = await encryptInviteCode(code, id, c.env.API_KEY_ENCRYPTION_KEY)
   const createdAt = Date.now()
   await c.env.DB.prepare(
     `INSERT INTO invites
-       (id, code_hash, max_uses, uses, expires_at, created_by, created_at)
-     VALUES (?, ?, ?, 0, ?, ?, ?)`
+       (id, code_hash, code_ciphertext, max_uses, uses, expires_at, created_by, created_at)
+     VALUES (?, ?, ?, ?, 0, ?, ?, ?)`
   )
-    .bind(id, codeHash, maxUses, expiresAt, user.id, createdAt)
+    .bind(id, codeHash, codeCiphertext, maxUses, expiresAt, user.id, createdAt)
     .run()
 
-  return jsonResponse(
+  return c.json(
     {
       invite: inviteView(
         {
           id,
           code_hash: codeHash,
+          code_ciphertext: codeCiphertext,
           max_uses: maxUses,
           uses: 0,
           expires_at: expiresAt,
@@ -809,11 +814,21 @@ adminRoutes.post('/invites', async (c) => {
 
 adminRoutes.get('/invites', async (c) => {
   const rows = await c.env.DB.prepare(
-    `SELECT id, code_hash, max_uses, uses, expires_at, created_by, created_at
+    `SELECT id, code_hash, code_ciphertext, max_uses, uses, expires_at, created_by, created_at
      FROM invites
      ORDER BY created_at DESC, id ASC`
   ).all<InviteRow>()
-  return jsonResponse({ invites: rows.results.map((row) => inviteView(row, null)) })
+  const invites = await Promise.all(
+    rows.results.map(async (row) =>
+      inviteView(
+        row,
+        row.code_ciphertext === null
+          ? null
+          : await decryptInviteCode(row.code_ciphertext, row.id, c.env.API_KEY_ENCRYPTION_KEY)
+      )
+    )
+  )
+  return c.json({ invites })
 })
 
 adminRoutes.delete('/invites/:id', async (c) => {

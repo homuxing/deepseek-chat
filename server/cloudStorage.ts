@@ -231,9 +231,7 @@ export const listActiveChats = async (
 ): Promise<{ sessions: SessionSummary[]; generation: string; revision: number }> => {
   await ensureActiveHistory(env, userId)
   const [historyResult, chatResult] = await env.DB.batch([
-    env.DB.prepare(
-      'SELECT generation, revision FROM cloud_history WHERE user_id = ?'
-    ).bind(userId),
+    env.DB.prepare('SELECT generation, revision FROM cloud_history WHERE user_id = ?').bind(userId),
     env.DB.prepare(
       `SELECT id, generation, revision, title, pinned,
               created_at AS createdAt, updated_at AS updatedAt
@@ -434,9 +432,7 @@ const claimFileDeletion = async (
   )
     .bind(userId, file.id, file.r2_key, protectRecent ? 1 : 0, cutoff)
     .run()
-  return result.meta.changes === 1 && isScopedR2Key(userId, file.r2_key)
-    ? file.r2_key
-    : null
+  return result.meta.changes === 1 && isScopedR2Key(userId, file.r2_key) ? file.r2_key : null
 }
 
 export type SaveChatResult =
@@ -567,15 +563,7 @@ export const saveChatSession = async (
              SELECT 1 FROM chats
              WHERE user_id = ? AND generation = ? AND id = ? AND body_key = ?
            )`
-      ).bind(
-        user.id,
-        expected.generation,
-        id,
-        user.id,
-        expected.generation,
-        id,
-        bodyKey
-      ),
+      ).bind(user.id, expected.generation, id, user.id, expected.generation, id, bodyKey),
       env.DB.prepare(
         `INSERT OR IGNORE INTO chat_files (user_id, generation, chat_id, file_id)
          SELECT ?, ?, ?, file_id FROM cloud_chat_refs
@@ -602,14 +590,7 @@ export const saveChatSession = async (
              SELECT 1 FROM chats
              WHERE user_id = ? AND generation = ? AND id = ? AND body_key = ?
            )`
-      ).bind(
-        user.id,
-        bodyKey,
-        user.id,
-        expected.generation,
-        id,
-        bodyKey
-      ),
+      ).bind(user.id, bodyKey, user.id, expected.generation, id, bodyKey),
     ])
     if (results[0].meta.changes === 0 || results[1].meta.changes === 0) {
       const live = await env.DB.prepare(`SELECT ${liveSessionSql} AS live`)
@@ -938,15 +919,10 @@ export const clearCloudChats = async (
        WHERE user_id = ? AND status IN ('uploading', 'completing', 'failed')`
     )
       .bind(userId)
-      .all<
-        Pick<UploadRow, 'id' | 'r2_key' | 'multipart_id' | 'status'>
-      >(),
+      .all<Pick<UploadRow, 'id' | 'r2_key' | 'multipart_id' | 'status'>>(),
   ])
   const emptyGeneration = `empty_${crypto.randomUUID().replaceAll('-', '')}`
-  const liveGuard =
-    sessionTokenHash === undefined
-      ? ''
-      : `AND ${liveSessionSql}`
+  const liveGuard = sessionTokenHash === undefined ? '' : `AND ${liveSessionSql}`
   const firstBindings =
     sessionTokenHash === undefined
       ? [emptyGeneration, userId, active.generation]
@@ -1040,10 +1016,62 @@ export const clearCloudChats = async (
   }
   await deleteR2Keys(
     env,
-    keyRows.results
-      .map((row) => row.key)
-      .filter((key) => isScopedR2Key(userId, key))
+    keyRows.results.map((row) => row.key).filter((key) => isScopedR2Key(userId, key))
   )
+}
+
+/** 先取消任务再清理对象；分片和完成请求会依据状态拒绝继续发布。 */
+const cleanupCancelledUpload = async (
+  env: AppEnv['Bindings'],
+  userId: string,
+  upload: Pick<UploadRow, 'id' | 'r2_key' | 'multipart_id'>
+): Promise<void> => {
+  try {
+    await env.FILES.resumeMultipartUpload(upload.r2_key, upload.multipart_id).abort()
+  } catch (error) {
+    // 已完成或已取消的 multipart 不再存在，仍需检查是否留下未引用对象。
+    const missing =
+      error instanceof Error &&
+      /NoSuchUpload|multipart upload not found|multipart upload does not exist/i.test(error.message)
+    if (!missing || (await isR2KeyReferenced(env, userId, upload.r2_key))) {
+      throw error
+    }
+  }
+  if (
+    isScopedR2Key(userId, upload.r2_key) &&
+    !(await isR2KeyReferenced(env, userId, upload.r2_key))
+  ) {
+    await env.FILES.delete(upload.r2_key)
+  }
+  await deleteStagedChatReferences(env, userId, upload.r2_key)
+  await env.DB.prepare('DELETE FROM cloud_upload_parts WHERE user_id = ? AND upload_id = ?')
+    .bind(userId, upload.id)
+    .run()
+}
+
+const cancelImportUploads = async (
+  env: AppEnv['Bindings'],
+  userId: string,
+  importId: string
+): Promise<void> => {
+  await env.DB.prepare(
+    `UPDATE cloud_uploads SET status = 'cancelled', updated_at = ?
+     WHERE user_id = ? AND import_id = ? AND status IN ('uploading', 'completing', 'failed')
+       AND EXISTS (
+         SELECT 1 FROM cloud_imports WHERE user_id = ? AND id = ? AND status = 'cancelled'
+       )`
+  )
+    .bind(Date.now(), userId, importId, userId, importId)
+    .run()
+  const uploads = await env.DB.prepare(
+    `SELECT id, r2_key, multipart_id FROM cloud_uploads
+     WHERE user_id = ? AND import_id = ? AND status = 'cancelled'`
+  )
+    .bind(userId, importId)
+    .all<Pick<UploadRow, 'id' | 'r2_key' | 'multipart_id'>>()
+  for (const upload of uploads.results) {
+    await cleanupCancelledUpload(env, userId, upload)
+  }
 }
 
 export const cleanupAbandonedStorage = async (env: AppEnv['Bindings']): Promise<void> => {
@@ -1053,7 +1081,7 @@ export const cleanupAbandonedStorage = async (env: AppEnv['Bindings']): Promise<
     const uploads = await env.DB.prepare(
       `SELECT user_id, id, r2_key, multipart_id
        FROM cloud_uploads
-       WHERE status IN ('uploading', 'failed') AND updated_at < ?
+       WHERE status IN ('uploading', 'completing', 'failed', 'cancelled') AND updated_at < ?
        ORDER BY updated_at ASC
        LIMIT 100`
     )
@@ -1071,26 +1099,14 @@ export const cleanupAbandonedStorage = async (env: AppEnv['Bindings']): Promise<
       const claimed = await env.DB.prepare(
         `UPDATE cloud_uploads SET status = 'cancelled', updated_at = ?
          WHERE user_id = ? AND id = ?
-           AND status IN ('uploading', 'failed') AND updated_at < ?`
+           AND status IN ('uploading', 'completing', 'failed', 'cancelled') AND updated_at < ?`
       )
         .bind(Date.now(), upload.user_id, upload.id, cutoff)
         .run()
       if (claimed.meta.changes === 0) {
         continue
       }
-      try {
-        await env.FILES.resumeMultipartUpload(
-          upload.r2_key,
-          upload.multipart_id
-        ).abort()
-      } catch {
-        if (
-          isScopedR2Key(upload.user_id, upload.r2_key) &&
-          !(await isR2KeyReferenced(env, upload.user_id, upload.r2_key))
-        ) {
-          await env.FILES.delete(upload.r2_key)
-        }
-      }
+      await cleanupCancelledUpload(env, upload.user_id, upload)
     }
   }
 
@@ -1098,7 +1114,7 @@ export const cleanupAbandonedStorage = async (env: AppEnv['Bindings']): Promise<
     const imports = await env.DB.prepare(
       `SELECT user_id, id, generation
        FROM cloud_imports
-       WHERE status = 'staging' AND updated_at < ?
+       WHERE status IN ('staging', 'cancelled') AND updated_at < ?
        ORDER BY updated_at ASC
        LIMIT 100`
     )
@@ -1110,13 +1126,14 @@ export const cleanupAbandonedStorage = async (env: AppEnv['Bindings']): Promise<
     for (const imported of imports.results) {
       const claimed = await env.DB.prepare(
         `UPDATE cloud_imports SET status = 'cancelled', updated_at = ?
-         WHERE user_id = ? AND id = ? AND status = 'staging' AND updated_at < ?`
+          WHERE user_id = ? AND id = ? AND status IN ('staging', 'cancelled') AND updated_at < ?`
       )
         .bind(Date.now(), imported.user_id, imported.id, cutoff)
         .run()
       if (claimed.meta.changes === 0) {
         continue
       }
+      await cancelImportUploads(env, imported.user_id, imported.id)
       await cleanupExpiredGenerations(env, imported.user_id)
       await cleanupImportFiles(env, imported.user_id, imported.id)
     }
@@ -1204,7 +1221,7 @@ cloudStorageRoutes.delete('/chats/imports/:id', async (c) => {
   if (!imported) {
     return errorResponse('导入任务不存在', 404)
   }
-  if (imported.status !== 'staging') {
+  if (imported.status === 'committed') {
     return errorResponse('该导入任务已结束，无法取消', 409)
   }
   const result = await c.env.DB.prepare(
@@ -1214,8 +1231,12 @@ cloudStorageRoutes.delete('/chats/imports/:id', async (c) => {
     .bind(Date.now(), user.id, id)
     .run()
   if (result.meta.changes === 0) {
-    return errorResponse('导入任务状态已变化', 409)
+    const current = await getImport(c.env, user.id, id)
+    if (current?.status !== 'cancelled') {
+      return errorResponse('导入任务状态已变化', 409)
+    }
   }
+  await cancelImportUploads(c.env, user.id, id)
   await cleanupExpiredGenerations(c.env, user.id)
   await cleanupImportFiles(c.env, user.id, id)
   return noContent()
@@ -1267,6 +1288,15 @@ cloudStorageRoutes.post('/chats/imports/:id/commit', async (c) => {
   if (!actual || Number(actual.count) !== body.count) {
     return errorResponse('导入会话数量与已上传数量不一致', 409)
   }
+  const unfinished = await c.env.DB.prepare(
+    `SELECT 1 AS found FROM cloud_uploads
+     WHERE user_id = ? AND import_id = ? AND status <> 'completed' LIMIT 1`
+  )
+    .bind(user.id, id)
+    .first<{ found: number }>()
+  if (unfinished) {
+    return errorResponse('导入内容尚未全部上传完成', 409)
+  }
   const active = await ensureActiveHistory(c.env, user.id)
   const nextRevision = imported.base_revision + 1
   const results = await c.env.DB.batch([
@@ -1279,6 +1309,9 @@ cloudStorageRoutes.post('/chats/imports/:id/commit', async (c) => {
              AND generation = ? AND base_revision = ?
          )
          AND (SELECT COUNT(*) FROM chats WHERE user_id = ? AND generation = ?) = ?
+         AND NOT EXISTS (
+           SELECT 1 FROM cloud_uploads WHERE user_id = ? AND import_id = ? AND status <> 'completed'
+         )
          AND ${liveSessionSql}`
     ).bind(
       imported.generation,
@@ -1292,6 +1325,8 @@ cloudStorageRoutes.post('/chats/imports/:id/commit', async (c) => {
       user.id,
       imported.generation,
       body.count,
+      user.id,
+      id,
       c.get('sessionTokenHash'),
       user.id,
       Date.now()
@@ -1373,7 +1408,11 @@ cloudStorageRoutes.post('/storage/uploads', async (c) => {
     }
   } else {
     generation =
-      body.generation === undefined ? active.generation : isGeneration(body.generation) ? body.generation : null
+      body.generation === undefined
+        ? active.generation
+        : isGeneration(body.generation)
+          ? body.generation
+          : null
     if (generation === null) {
       return errorResponse('generation 无效')
     }
@@ -1439,17 +1478,20 @@ cloudStorageRoutes.post('/storage/uploads', async (c) => {
   const key = `${user.id}/uploads/${uploadId}`
   const multipart = await c.env.FILES.createMultipartUpload(key, {
     httpMetadata: {
-      contentType:
-        body.kind === 'file' ? (mimeType as string) : 'application/json; charset=utf-8',
+      contentType: body.kind === 'file' ? (mimeType as string) : 'application/json; charset=utf-8',
     },
     customMetadata: { user_id: user.id, upload_id: uploadId, kind: body.kind },
   })
   try {
-    await c.env.DB.prepare(
+    const inserted = await c.env.DB.prepare(
       `INSERT INTO cloud_uploads
          (user_id, id, kind, object_id, generation, import_id, base_revision,
           r2_key, multipart_id, summary_json, files_json, mime_type, status, created_at, updated_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'uploading', ?, ?)`
+       SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'uploading', ?, ?
+       WHERE ? IS NULL OR EXISTS (
+         SELECT 1 FROM cloud_imports
+         WHERE user_id = ? AND id = ? AND generation = ? AND status = 'staging'
+       )`
     )
       .bind(
         user.id,
@@ -1465,9 +1507,17 @@ cloudStorageRoutes.post('/storage/uploads', async (c) => {
         filesJson,
         mimeType,
         Date.now(),
-        Date.now()
+        Date.now(),
+        importId,
+        user.id,
+        importId,
+        generation
       )
       .run()
+    if (inserted.meta.changes === 0) {
+      await multipart.abort()
+      return errorResponse('导入任务已经结束，无法创建上传', 409)
+    }
   } catch (error) {
     await multipart.abort()
     throw error
@@ -1494,8 +1544,26 @@ cloudStorageRoutes.put('/storage/uploads/:id/parts/:part', async (c) => {
   if (upload.status !== 'uploading') {
     return errorResponse('上传任务当前不可写入分片', 409)
   }
-  const multipart = c.env.FILES.resumeMultipartUpload(upload.r2_key, upload.multipart_id)
-  const part = await multipart.uploadPart(partNumber, c.req.raw.body ?? new Uint8Array())
+  if (upload.import_id !== null) {
+    const imported = await getImport(c.env, user.id, upload.import_id)
+    if (imported?.status !== 'staging') {
+      return errorResponse('导入任务已经结束', 409)
+    }
+  }
+  let part: R2UploadedPart
+  try {
+    const multipart = c.env.FILES.resumeMultipartUpload(upload.r2_key, upload.multipart_id)
+    part = await multipart.uploadPart(partNumber, c.req.raw.body ?? new Uint8Array())
+  } catch (error) {
+    const current = await findUpload(c.env, user.id, uploadId)
+    if (!current || current.status !== 'uploading') {
+      return errorResponse('上传任务状态已变化', 409)
+    }
+    if (c.req.raw.signal.aborted || (error instanceof Error && error.name === 'AbortError')) {
+      return errorResponse('上传连接已中断', 400)
+    }
+    throw error
+  }
   const now = Date.now()
   const statements = [
     c.env.DB.prepare(
@@ -1572,9 +1640,7 @@ const publishUpload = async (
   size: number
 ): Promise<PublishResult> => {
   if (upload.kind === 'file') {
-    const previous = await env.DB.prepare(
-      'SELECT r2_key FROM files WHERE user_id = ? AND id = ?'
-    )
+    const previous = await env.DB.prepare('SELECT r2_key FROM files WHERE user_id = ? AND id = ?')
       .bind(user.id, upload.object_id)
       .first<{ r2_key: string }>()
     const results = await env.DB.batch([
@@ -1846,14 +1912,7 @@ const publishUpload = async (
              SELECT 1 FROM chats
              WHERE user_id = ? AND generation = ? AND id = ? AND body_key = ?
            )`
-      ).bind(
-        user.id,
-        upload.r2_key,
-        user.id,
-        upload.generation,
-        upload.object_id,
-        upload.r2_key
-      ),
+      ).bind(user.id, upload.r2_key, user.id, upload.generation, upload.object_id, upload.r2_key),
     ])
     if (results[0].meta.changes === 0) {
       return { kind: 'conflict', message: '导入任务状态已变化' }
@@ -2027,14 +2086,7 @@ const publishUpload = async (
            SELECT 1 FROM chats
            WHERE user_id = ? AND generation = ? AND id = ? AND body_key = ?
          )`
-    ).bind(
-      user.id,
-      upload.r2_key,
-      user.id,
-      upload.generation,
-      upload.object_id,
-      upload.r2_key
-    ),
+    ).bind(user.id, upload.r2_key, user.id, upload.generation, upload.object_id, upload.r2_key),
   ])
   if (results[0].meta.changes === 0) {
     const live = await env.DB.prepare(`SELECT ${liveSessionSql} AS live`)
@@ -2162,22 +2214,25 @@ cloudStorageRoutes.post('/storage/uploads/:id/complete', async (c) => {
       object.size
     )
     if (published.kind !== 'ok') {
-      const status = published.kind === 'unauthorized' ? 401 : published.kind === 'invalid' ? 500 : 409
+      const current = await findUpload(c.env, user.id, uploadId)
+      const status =
+        published.kind === 'unauthorized' ? 401 : published.kind === 'invalid' ? 400 : 409
       await deleteStagedChatReferences(c.env, user.id, upload.r2_key)
       await c.env.DB.prepare(
         `UPDATE cloud_uploads SET status = 'failed', updated_at = ?
-         WHERE user_id = ? AND id = ?`
+         WHERE user_id = ? AND id = ? AND status = 'completing'`
       )
         .bind(Date.now(), user.id, uploadId)
         .run()
       await c.env.FILES.delete(upload.r2_key)
+      if (!current || current.status === 'cancelled') {
+        return errorResponse('上传任务已取消', 409)
+      }
       return errorResponse(published.message, status)
     }
     try {
       await deleteStagedChatReferences(c.env, user.id, upload.r2_key)
-      await c.env.DB.prepare(
-        'DELETE FROM cloud_upload_parts WHERE user_id = ? AND upload_id = ?'
-      )
+      await c.env.DB.prepare('DELETE FROM cloud_upload_parts WHERE user_id = ? AND upload_id = ?')
         .bind(user.id, uploadId)
         .run()
     } catch (error) {
@@ -2195,6 +2250,16 @@ cloudStorageRoutes.post('/storage/uploads/:id/complete', async (c) => {
     })
   } catch (error) {
     const current = await findUpload(c.env, user.id, uploadId)
+    if (!current || current.status === 'cancelled') {
+      if (
+        isScopedR2Key(user.id, upload.r2_key) &&
+        !(await isR2KeyReferenced(c.env, user.id, upload.r2_key))
+      ) {
+        await c.env.FILES.delete(upload.r2_key)
+      }
+      await deleteStagedChatReferences(c.env, user.id, upload.r2_key)
+      return errorResponse('上传任务已取消', 409)
+    }
     if (current?.status === 'completed') {
       const currentSummary =
         current.kind === 'chat' && current.summary_json
@@ -2249,9 +2314,7 @@ cloudStorageRoutes.get('/storage/uploads/:id', async (c) => {
     }
     summary = {
       ...summary,
-      ...(upload.completed_revision === null
-        ? {}
-        : { revision: upload.completed_revision }),
+      ...(upload.completed_revision === null ? {} : { revision: upload.completed_revision }),
       generation: upload.generation,
     }
   }
@@ -2278,6 +2341,7 @@ cloudStorageRoutes.delete('/storage/uploads/:id', async (c) => {
     return errorResponse('上传任务已经完成，无法取消', 409)
   }
   if (upload.status === 'cancelled') {
+    await cleanupCancelledUpload(c.env, user.id, upload)
     return noContent()
   }
   if (upload.status === 'completing') {
@@ -2296,19 +2360,7 @@ cloudStorageRoutes.delete('/storage/uploads/:id', async (c) => {
     }
     return errorResponse('上传正文正在发布或已经完成，当前无法取消', 409)
   }
-  if (upload.status === 'uploading' || upload.status === 'failed') {
-    try {
-      const multipart = c.env.FILES.resumeMultipartUpload(upload.r2_key, upload.multipart_id)
-      await multipart.abort()
-    } catch {
-      if (
-        isScopedR2Key(user.id, upload.r2_key) &&
-        !(await isR2KeyReferenced(c.env, user.id, upload.r2_key))
-      ) {
-        await c.env.FILES.delete(upload.r2_key)
-      }
-    }
-  }
+  await cleanupCancelledUpload(c.env, user.id, upload)
   return noContent()
 })
 

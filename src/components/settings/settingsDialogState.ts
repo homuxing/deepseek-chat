@@ -1,4 +1,8 @@
 import { create } from 'zustand'
+import {
+  isHistoryImportActive,
+  useHistoryImportProgress,
+} from '../../services/chat/importProgress.js'
 
 /** 设置弹窗的分组：通用设置 / 数据管理 */
 export type SettingsSection = 'general' | 'data'
@@ -12,7 +16,11 @@ export const useSettingsDialog = create(() => ({
 export const openSettings = (section: SettingsSection) =>
   useSettingsDialog.setState({ open: true, section })
 
-export const closeSettings = () => useSettingsDialog.setState({ open: false })
+export const closeSettings = () => {
+  if (!isHistoryImportActive(useHistoryImportProgress.getState().phase)) {
+    useSettingsDialog.setState({ open: false })
+  }
+}
 
 /**
  * Every signed-in user has a server-side fallback key. Existing callers still use this

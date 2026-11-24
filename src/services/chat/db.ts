@@ -375,6 +375,7 @@ export const createCloudImport = async (identity: BackendIdentity, signal: Abort
     },
   }
   const path = '/api/chats/imports/' + encodeURIComponent(importId)
+  let committed = false
   return {
     sink,
     async commit(): Promise<SessionSummary[]> {
@@ -412,6 +413,7 @@ export const createCloudImport = async (identity: BackendIdentity, signal: Abort
       if (!result || result.count !== sessions) {
         throw new Error('无法确认完整历史已保存')
       }
+      committed = true
       rememberVersion(result)
       savedVersions.clear()
       try {
@@ -425,6 +427,9 @@ export const createCloudImport = async (identity: BackendIdentity, signal: Abort
     },
     async cancel(): Promise<void> {
       assertBackendIdentity(identity)
+      if (committed) {
+        return
+      }
       await apiJson(path, { method: 'DELETE' }, identity)
     },
   }

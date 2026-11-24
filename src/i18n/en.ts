@@ -144,7 +144,10 @@ export const en = {
   historyImportDescription:
     'Importing replaces all chat history and attachments saved in your account and syncs the result to your other signed-in devices. Supports ZIP files exported from DeepSeek.',
   historyImportChecking: 'Checking import file...',
-  historyImportUploading: 'Saved {sessions} chats and {files} attachments',
+  historyImportInProgress: 'Importing chat history',
+  historyImportErrorTitle: 'Import incomplete',
+  historyImportKeepOpen: 'Keep this page open and stay connected until the import finishes.',
+  historyImportUploading: 'Uploaded {sessions} chats and {files} attachments',
   historyImportCommitting: 'Saving import result...',
   historyImportedOne: 'Imported 1 chat',
   historyImported: 'Imported {count} chats',

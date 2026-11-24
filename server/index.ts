@@ -63,6 +63,39 @@ app.use('/api/*', async (c, next) => {
       : c.req.path === '/api/v1/tools/asr'
         ? 9 * 1024 * 1024
         : 1024 * 1024
+  if (multipartPart && c.req.method === 'PUT' && c.req.raw.body) {
+    // 在大小检查入口识别连接中断，完整读取一个分片后才允许写入 R2。
+    const reader = c.req.raw.body.getReader()
+    const chunks: Uint8Array[] = []
+    let bytes = 0
+    try {
+      for (;;) {
+        const result = await reader.read()
+        if (result.done) {
+          break
+        }
+        bytes += result.value.byteLength
+        if (bytes > size) {
+          await reader.cancel()
+          return c.json({ error: { message: '请求数据过大' } }, 413)
+        }
+        chunks.push(result.value)
+      }
+    } catch {
+      return c.json({ error: { message: '上传连接已中断' } }, 400)
+    } finally {
+      reader.releaseLock()
+    }
+    const body = new Uint8Array(bytes)
+    let offset = 0
+    for (const chunk of chunks) {
+      body.set(chunk, offset)
+      offset += chunk.byteLength
+    }
+    c.req.raw = new Request(c.req.raw, { body })
+    await next()
+    return
+  }
   return bodyLimit({
     maxSize: size,
     onError: (ctx) => ctx.json({ error: { message: '请求数据过大' } }, 413),

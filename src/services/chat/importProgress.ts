@@ -16,8 +16,8 @@ const createInitialState = (): HistoryImportProgress => ({
 })
 
 /**
- * 导入状态独立于设置弹窗保存，关闭设置或组件卸载不会中断导入，
- * 重新打开设置时可继续读取当前阶段和计数。
+ * 导入状态独立于设置弹窗保存，组件卸载不会中断任务，
+ * 进度弹窗与关闭保护共同读取当前阶段和计数。
  */
 export const useHistoryImportProgress = create<HistoryImportProgress>(createInitialState)
 

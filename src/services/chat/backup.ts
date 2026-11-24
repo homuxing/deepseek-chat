@@ -71,6 +71,14 @@ export const importHistory = (file: File): Promise<number> => {
   importActive = true
   const identity = captureBackendIdentity()
   const controller = new AbortController()
+  const preventLeave = (event: BeforeUnloadEvent) => {
+    event.preventDefault()
+    // 浏览器只展示原生确认文案；returnValue 兼容仍要求该属性的版本。
+    event.returnValue = ' '
+  }
+  if (typeof window !== 'undefined') {
+    window.addEventListener('beforeunload', preventLeave)
+  }
   const unsubscribe = onBackendIdentityChange(() => {
     try {
       assertBackendIdentity(identity)
@@ -108,6 +116,9 @@ export const importHistory = (file: File): Promise<number> => {
     .finally(() => {
       importActive = false
       unsubscribe()
+      if (typeof window !== 'undefined') {
+        window.removeEventListener('beforeunload', preventLeave)
+      }
     })
 }
 

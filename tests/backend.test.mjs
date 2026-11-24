@@ -78,7 +78,7 @@ class LocalR2 {
         ? new Uint8Array(await new Response(bytes).arrayBuffer())
         : typeof bytes === 'string'
           ? new TextEncoder().encode(bytes)
-        : new Uint8Array(bytes)
+          : new Uint8Array(bytes)
     this.objects.set(key, { bytes: value, options })
     await this.afterPut?.(key)
     return { size: value.byteLength }
@@ -142,7 +142,7 @@ class LocalR2 {
             ? new Uint8Array(await new Response(bytes).arrayBuffer())
             : typeof bytes === 'string'
               ? new TextEncoder().encode(bytes)
-            : new Uint8Array(bytes)
+              : new Uint8Array(bytes)
         const etag = `part-${partNumber}-${value.byteLength}`
         upload.parts.set(partNumber, { bytes: value, etag })
         return { partNumber, etag }
@@ -252,10 +252,11 @@ const createInvite = async (cookie, maxUses = 1) => {
   assert.equal(res.status, 201)
   return (await res.json()).invite
 }
-const register = async (username, code) => {
+const register = async (username, code, headers = {}) => {
   const res = await call('/api/auth/register', {
     method: 'POST',
     body: { username, password: 'a-good-password', inviteCode: code },
+    headers,
   })
   assert.equal(res.status, 201, await res.clone().text())
   return { cookie: cookieFrom(res), user: (await res.json()).user }
@@ -406,10 +407,182 @@ test('invite consumption is bounded and failed registration rolls back usage', a
     )
   )
   assert.deepEqual(attempts.map((res) => res.status).sort(), [201, 400])
+  assert.equal(db.db.prepare('SELECT uses FROM invites WHERE id = ?').get(single.id).uses, 1)
   const listed = await (await call('/api/admin/invites', { cookie: admin.cookie })).json()
-  assert.ok(listed.invites.every((item) => item.code === null))
-  assert.ok(!JSON.stringify(listed).includes(invite.code))
+  assert.equal(listed.invites.find((item) => item.id === invite.id).code, invite.code)
+  assert.equal(listed.invites.find((item) => item.id === invite.id).uses, 2)
   assert.equal((await call('/api/admin/users', { cookie: alice.cookie })).status, 403)
+})
+
+test('管理员重新登录后可读取原邀请码，列表与数据库中的使用次数一致', async () => {
+  const invite = await createInvite(admin.cookie, 3)
+  const stored = db.db.prepare('SELECT * FROM invites WHERE id = ?').get(invite.id)
+  assert.notEqual(invite.code, invite.id)
+  assert.equal(stored.code_hash, await sha256(invite.code))
+  assert.match(stored.code_ciphertext, /^v1\./)
+  assert.ok(!JSON.stringify(stored).includes(invite.code))
+
+  const login = await call('/api/admin/login', {
+    method: 'POST',
+    body: { username: env.ADMIN_USERNAME, password: env.ADMIN_PASSWORD },
+  })
+  assert.equal(login.status, 200)
+  const cookie = cookieFrom(login)
+  await register('invite_reader', ` ${invite.code} `, { 'CF-Connecting-IP': 'invite-reader' })
+  for (const currentCookie of [admin.cookie, cookie]) {
+    const response = await call('/api/admin/invites', { cookie: currentCookie })
+    assert.equal(response.status, 200)
+    assert.equal(response.headers.get('Cache-Control'), 'no-store')
+    const listed = (await response.json()).invites.find((item) => item.id === invite.id)
+    assert.equal(listed.code, invite.code)
+    assert.equal(listed.uses, 1)
+    assert.equal(listed.maxUses, 3)
+    assert.equal(listed.code_hash, undefined)
+    assert.equal(listed.code_ciphertext, undefined)
+  }
+  assert.equal((await call('/api/admin/invites')).status, 401)
+  assert.equal((await call('/api/admin/invites', { cookie: alice.cookie })).status, 403)
+})
+
+test('历史邀请码保留原注册能力，记录 ID 无法用于注册', async () => {
+  const code = 'legacy-invite-original-code'
+  const id = crypto.randomUUID()
+  db.db
+    .prepare(
+      'INSERT INTO invites (id, code_hash, max_uses, uses, created_by, created_at) VALUES (?, ?, 2, 1, ?, ?)'
+    )
+    .run(id, await sha256(code), admin.user.id, Date.now())
+  try {
+    const listed = (
+      await (await call('/api/admin/invites', { cookie: admin.cookie })).json()
+    ).invites.find((item) => item.id === id)
+    assert.equal(listed.code, null)
+    assert.equal(listed.uses, 1)
+    assert.equal(listed.maxUses, 2)
+    const invalid = await call('/api/auth/register', {
+      method: 'POST',
+      body: { username: 'invite_record_id', password: 'a-good-password', inviteCode: id },
+      headers: { 'CF-Connecting-IP': 'invite-legacy' },
+    })
+    assert.equal(invalid.status, 400)
+    assert.equal(db.db.prepare('SELECT uses FROM invites WHERE id = ?').get(id).uses, 1)
+    await register('invite_legacy', code, { 'CF-Connecting-IP': 'invite-legacy' })
+    assert.equal(db.db.prepare('SELECT uses FROM invites WHERE id = ?').get(id).uses, 2)
+  } finally {
+    db.db.prepare('DELETE FROM invites WHERE id = ?').run(id)
+  }
+})
+
+test('邀请码读取和创建失败如实报错，恢复密钥或密文后继续读取原码', async () => {
+  const invite = await createInvite(admin.cookie)
+  const other = await createInvite(admin.cookie)
+  const stored = db.db.prepare('SELECT * FROM invites WHERE id = ?').get(invite.id)
+  const otherCiphertext = db.db
+    .prepare('SELECT code_ciphertext FROM invites WHERE id = ?')
+    .get(other.id).code_ciphertext
+  const secret = env.API_KEY_ENCRYPTION_KEY
+  try {
+    for (const invalidSecret of [
+      undefined,
+      'short',
+      'different-secret-with-at-least-32-characters',
+    ]) {
+      env.API_KEY_ENCRYPTION_KEY = invalidSecret
+      const response = await call('/api/admin/invites', { cookie: admin.cookie })
+      assert.equal(response.status, 503)
+      const failed = await response.json()
+      assert.equal(failed.invites, undefined)
+      assert.match(failed.error.message, /邀请码/)
+      assert.ok(!JSON.stringify(failed).includes(stored.code_ciphertext))
+      if (invalidSecret === undefined || invalidSecret === 'short') {
+        const count = db.db.prepare('SELECT COUNT(*) AS n FROM invites').get().n
+        const created = await call('/api/admin/invites', {
+          method: 'POST',
+          cookie: admin.cookie,
+          body: { maxUses: 1 },
+        })
+        assert.equal(created.status, 503)
+        assert.equal(db.db.prepare('SELECT COUNT(*) AS n FROM invites').get().n, count)
+      }
+    }
+    env.API_KEY_ENCRYPTION_KEY = secret
+    for (const damaged of ['broken', otherCiphertext]) {
+      db.db.prepare('UPDATE invites SET code_ciphertext = ? WHERE id = ?').run(damaged, invite.id)
+      const response = await call('/api/admin/invites', { cookie: admin.cookie })
+      assert.equal(response.status, 503)
+      assert.equal((await response.json()).invites, undefined)
+    }
+    db.db
+      .prepare('UPDATE invites SET code_ciphertext = ? WHERE id = ?')
+      .run(stored.code_ciphertext, invite.id)
+    const response = await call('/api/admin/invites', { cookie: admin.cookie })
+    assert.equal(response.status, 200)
+    assert.equal(
+      (await response.json()).invites.find((item) => item.id === invite.id).code,
+      invite.code
+    )
+  } finally {
+    env.API_KEY_ENCRYPTION_KEY = secret
+    db.db
+      .prepare('UPDATE invites SET code_ciphertext = ? WHERE id = ?')
+      .run(stored.code_ciphertext, invite.id)
+  }
+})
+
+test('邀请码过期后拒绝注册且不增加使用次数', async () => {
+  const expiresAt = Date.now() + 60_000
+  const created = await call('/api/admin/invites', {
+    method: 'POST',
+    cookie: admin.cookie,
+    body: { maxUses: 2, expiresAt },
+  })
+  assert.equal(created.status, 201)
+  const invite = (await created.json()).invite
+  const originalNow = Date.now
+  Date.now = () => expiresAt
+  try {
+    const response = await call('/api/auth/register', {
+      method: 'POST',
+      body: { username: 'invite_expired', password: 'a-good-password', inviteCode: invite.code },
+      headers: { 'CF-Connecting-IP': 'invite-expired' },
+    })
+    assert.equal(response.status, 400)
+    assert.equal(db.db.prepare('SELECT uses FROM invites WHERE id = ?').get(invite.id).uses, 0)
+    assert.equal(
+      db.db.prepare('SELECT id FROM users WHERE username = ?').get('invite_expired'),
+      undefined
+    )
+    const listed = (
+      await (await call('/api/admin/invites', { cookie: admin.cookie })).json()
+    ).invites.find((item) => item.id === invite.id)
+    assert.equal(listed.code, invite.code)
+    assert.equal(listed.expiresAt, expiresAt)
+  } finally {
+    Date.now = originalNow
+  }
+})
+
+test('邀请码密文迁移保留历史记录的哈希、次数和有效期', () => {
+  const legacy = new DatabaseSync(':memory:')
+  try {
+    legacy.exec(readFileSync('migrations/0001_initial.sql', 'utf8'))
+    legacy.exec(`
+      INSERT INTO users (id, username, role, created_at) VALUES ('admin', 'admin', 'admin', 1);
+      INSERT INTO invites (id, code_hash, max_uses, uses, expires_at, created_by, created_at)
+      VALUES ('invite', 'existing-hash', 5, 3, 9999999999999, 'admin', 2);
+    `)
+    const original = legacy.prepare('SELECT * FROM invites').get()
+    legacy.exec(readFileSync('migrations/0005_invite_codes.sql', 'utf8'))
+    assert.deepEqual(
+      { ...legacy.prepare('SELECT * FROM invites').get() },
+      {
+        ...original,
+        code_ciphertext: null,
+      }
+    )
+  } finally {
+    legacy.close()
+  }
 })
 
 const session = (title = 'Alice chat') => ({

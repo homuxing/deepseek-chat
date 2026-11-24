@@ -6,7 +6,8 @@ import { build } from 'esbuild'
 mkdirSync('test-results', { recursive: true })
 await build({
   stdin: {
-    contents: "export * from './src/services/chat/importProgress.ts'",
+    contents:
+      "export * from './src/services/chat/importProgress.ts'; export * from './src/components/settings/settingsDialogState.ts'",
     resolveDir: process.cwd(),
     loader: 'ts',
   },
@@ -22,9 +23,29 @@ const {
   resetHistoryImportProgress,
   setHistoryImportProgress,
   useHistoryImportProgress,
+  openSettings,
+  closeSettings,
+  useSettingsDialog,
 } = await import('../test-results/importProgress.mjs')
 
 after(resetHistoryImportProgress)
+
+test('检查、上传和提交期间禁止关闭设置，结束后恢复关闭', () => {
+  for (const phase of ['checking', 'uploading', 'committing']) {
+    setHistoryImportProgress({ phase })
+    openSettings('data')
+    closeSettings()
+    assert.equal(useSettingsDialog.getState().open, true)
+  }
+  for (const phase of ['done', 'error', 'idle']) {
+    setHistoryImportProgress({ phase })
+    closeSettings()
+    assert.equal(useSettingsDialog.getState().open, false)
+    openSettings('data')
+  }
+  resetHistoryImportProgress()
+  closeSettings()
+})
 
 test('导入状态从空闲开始', () => {
   resetHistoryImportProgress()

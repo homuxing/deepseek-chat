@@ -447,7 +447,7 @@ export const AdminPanel = ({
               <div className={styles.empty} role="status">
                 正在加载邀请码…
               </div>
-            ) : invites.length === 0 ? (
+            ) : invitesError ? null : invites.length === 0 ? (
               <div className={styles.empty}>还没有邀请码。</div>
             ) : (
               <div className={styles.tableScroller}>
@@ -473,9 +473,11 @@ export const AdminPanel = ({
                         <tr key={invite.id}>
                           <td>
                             <div className={styles.inviteCode}>
-                              <code title={invite.code === null ? '邀请记录 ID' : undefined}>
-                                {invite.code ?? invite.id}
-                              </code>
+                              {invite.code === null ? (
+                                <span className={styles.fieldHint}>原邀请码无法查看</span>
+                              ) : (
+                                <code>{invite.code}</code>
+                              )}
                               {expired || usedUp ? (
                                 <span className={styles.badgeMuted}>
                                   {expired ? '已过期' : '已用完'}

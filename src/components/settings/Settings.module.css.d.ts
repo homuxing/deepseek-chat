@@ -32,6 +32,8 @@ declare const styles: {
   readonly mobileConfirm: string
   readonly importConfirm: string
   readonly importConfirmText: string
+  readonly importProgress: string
+  readonly importSpinner: string
   readonly deleteConfirm: string
   readonly deleteActions: string
 }

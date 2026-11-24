@@ -137,7 +137,10 @@ export const zh = {
   historyImportDescription:
     '导入会覆盖账号中保存的全部历史对话和附件，并同步到其他已登录设备。支持 DeepSeek 导出的 ZIP 文件。',
   historyImportChecking: '正在检查导入文件',
-  historyImportUploading: '已保存 {sessions} 个会话/{files} 个附件',
+  historyImportInProgress: '正在导入历史对话',
+  historyImportErrorTitle: '导入未完成',
+  historyImportKeepOpen: '请保持页面打开并保持网络连接，等待导入完成。',
+  historyImportUploading: '已上传 {sessions} 个对话、{files} 个附件',
   historyImportCommitting: '正在保存导入结果',
   historyImportedOne: '已导入 1 个对话',
   historyImported: '已导入 {count} 个对话',

@@ -5,6 +5,7 @@ import { build } from 'esbuild'
 
 const ENTRY = `
   export { app } from './server/index.ts'
+  export { cleanupAbandonedStorage } from './server/cloudStorage.ts'
   export { sha256, hashPassword } from './server/security.ts'
   export * as backup from './src/services/chat/backup.ts'
   export * as db from './src/services/chat/db.ts'
@@ -515,6 +516,7 @@ export const createCloudHarness = async () => {
         method,
         headers: requestHeaders,
         body: requestBody,
+        ...(requestBody instanceof ReadableStream ? { duplex: 'half' } : {}),
       },
       env
     )

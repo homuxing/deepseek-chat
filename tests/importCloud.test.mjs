@@ -23,6 +23,93 @@ const withHarness = async (run) => {
 
 const plain = (value) => JSON.parse(JSON.stringify(value))
 
+test('导入全过程绑定离开页面提醒，失败后移除提醒并保留历史', async () => {
+  await withHarness(async (harness) => {
+    const { modules } = harness
+    const user = await harness.addUser('leave_protection')
+    harness.setCurrentUser(user, { reset: true })
+    await modules.store.initChat()
+    const originalWindow = globalThis.window
+    const page = new EventTarget()
+    globalThis.window = page
+    const archive = await buildArchive(modules, {
+      sessions: [makeSession({ id: 'leave-protected' })],
+    })
+    const rejectPart = harness.intercept((request) => {
+      if (request.method === 'PUT' && /\/parts\/1$/.test(request.path)) {
+        return { error: new TypeError('网络连接已中断') }
+      }
+    })
+    try {
+      const importing = modules.backup.importHistory(toFile(archive))
+      const leaving = new Event('beforeunload', { cancelable: true })
+      page.dispatchEvent(leaving)
+      assert.equal(leaving.defaultPrevented, true)
+      await assert.rejects(importing, /网络连接已中断/)
+      const afterFailure = new Event('beforeunload', { cancelable: true })
+      page.dispatchEvent(afterFailure)
+      assert.equal(afterFailure.defaultPrevented, false)
+      assert.equal(modules.importProgress.useHistoryImportProgress.getState().phase, 'error')
+      assert.equal(modules.store.useChatStore.getState().importingHistory, false)
+      assert.equal(harness.files.multipartUploads.size, 0)
+      assert.ok(
+        harness.requests
+          .filter((request) => request.status !== null)
+          .every((request) => request.status < 500)
+      )
+      rejectPart()
+      const success = modules.backup.importHistory(toFile(archive))
+      assert.equal(await success, 1)
+      const afterSuccess = new Event('beforeunload', { cancelable: true })
+      page.dispatchEvent(afterSuccess)
+      assert.equal(afterSuccess.defaultPrevented, false)
+    } finally {
+      rejectPart()
+      if (originalWindow === undefined) delete globalThis.window
+      else globalThis.window = originalWindow
+    }
+  })
+})
+
+test('提交成功后读取列表失败明确报告已保存，不再取消已提交任务', async () => {
+  await withHarness(async (harness) => {
+    const { modules } = harness
+    const user = await harness.addUser('committed_read_failure')
+    harness.setCurrentUser(user, { reset: true })
+    await modules.store.initChat()
+    const archive = await buildArchive(modules, {
+      sessions: [makeSession({ id: 'saved-before-read-failure' })],
+    })
+    let committed = false
+    harness.intercept((request) => {
+      if (request.method === 'POST' && /\/imports\/[^/]+\/commit$/.test(request.path)) {
+        return {
+          afterResponse: () => {
+            committed = true
+          },
+        }
+      }
+      if (committed && request.method === 'GET' && request.path === '/api/chats') {
+        return { error: new TypeError('网络连接已中断') }
+      }
+    })
+    await assert.rejects(
+      modules.backup.importHistory(toFile(archive)),
+      /历史已保存至云端，但读取更新失败/
+    )
+    assert.deepEqual(
+      (await harness.snapshotAs(user)).sessions.map((summary) => summary.id),
+      ['saved-before-read-failure']
+    )
+    assert.equal(
+      harness.requests.some(
+        (request) => request.method === 'DELETE' && /\/imports\/[^/]+$/.test(request.path)
+      ),
+      false
+    )
+  })
+})
+
 const localSession = (modules, session, fileTypes = new Map()) => {
   const local = modules.toLocalSession(session).session
   for (const message of local.messages) {

@@ -53,7 +53,51 @@ import styles from './Settings.module.css'
  */
 export const SettingsDialog = () => {
   const open = useSettingsDialog((state) => state.open)
-  return open ? <SettingsContent /> : null
+  return (
+    <>
+      {open ? <SettingsContent /> : null}
+      <ImportProgressDialog />
+    </>
+  )
+}
+
+/** 进度弹窗独立于设置内容，整个导入期间阻止操作下层页面。 */
+const ImportProgressDialog = () => {
+  const t = useTranslate()
+  const progress = useHistoryImportProgress()
+  const [dismissedError, setDismissedError] = useState<HistoryImportProgress | null>(null)
+  const active = isHistoryImportActive(progress.phase)
+  if (!active && (progress.phase !== 'error' || progress === dismissedError)) {
+    return null
+  }
+  const status = historyImportStatus(progress)
+  return (
+    <Modal
+      title={t(active ? 'historyImportInProgress' : 'historyImportErrorTitle')}
+      className={styles.importConfirm}
+      dismissible={!active}
+      onClose={() => setDismissedError(progress)}
+      footer={
+        active ? undefined : (
+          <Button autoFocus onClick={() => setDismissedError(progress)}>
+            {t('close')}
+          </Button>
+        )
+      }
+    >
+      <div className={styles.importProgress} aria-busy={active}>
+        {active ? <span className={styles.importSpinner} aria-hidden="true" /> : null}
+        <div
+          role={active ? 'status' : 'alert'}
+          aria-live="polite"
+          className={active ? undefined : styles.error}
+        >
+          {status ? t(status.key, status.params) : null}
+        </div>
+        {active ? <div className={styles.description}>{t('historyImportKeepOpen')}</div> : null}
+      </div>
+    </Modal>
+  )
 }
 
 const sections: { value: SettingsSection; label: TranslationKey; icon: ReactNode }[] = [
@@ -82,11 +126,11 @@ const SettingsContent = () => {
     <>
       <Modal
         title={t('settings')}
-        closable
+        closable={!isHistoryImportActive(importProgress.phase)}
         className={styles.dialog}
         mainClassName={styles.dialogMain}
         onClose={() => {
-          if (!historyDelete.busy && !apiKeyEditor.form.verifying) {
+          if (!historyBusy && !apiKeyEditor.form.verifying) {
             closeSettings()
           }
         }}
